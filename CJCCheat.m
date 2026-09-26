@@ -324,6 +324,7 @@ typedef struct {
     const char*       (*method_get_name)(Il2CppMethodInfo *);
     int               (*method_get_param_count)(Il2CppMethodInfo *);
     const char*       (*field_get_name)(Il2CppFieldInfo *);
+    uint32_t          (*field_get_flags)(Il2CppFieldInfo *);
     size_t            (*field_get_offset)(Il2CppFieldInfo *);
     void              (*field_get_value)(Il2CppObject *, Il2CppFieldInfo *, void *);
     void              (*field_set_value)(Il2CppObject *, Il2CppFieldInfo *, void *);
@@ -389,6 +390,7 @@ static int mx_il2cpp_load(void) {
         {"_il2cpp_method_get_name",            (void **)&I.method_get_name},
         {"_il2cpp_method_get_param_count",     (void **)&I.method_get_param_count},
         {"_il2cpp_field_get_name",             (void **)&I.field_get_name},
+        {"_il2cpp_field_get_flags",            (void **)&I.field_get_flags},
         {"_il2cpp_field_get_offset",           (void **)&I.field_get_offset},
         {"_il2cpp_field_get_value",            (void **)&I.field_get_value},
         {"_il2cpp_field_set_value",            (void **)&I.field_set_value},
@@ -894,67 +896,83 @@ static const char *kLuaHook =
 //      → 读字段 luaState (SLua.LuaState 对象)
 //        → 读字段 l_ (lua_State*)
 // 主线程 tick 里 Lua 不在执行中，注入最安全。
+// ⭐ 实测结论：
+//   - LuaSvr 不是 UnityEngine.Object 子类 → FindObjectOfType 必抛异常（此路不通）
+//   - LuaState 有静态字段（statemap / main 等），且实例第一个字段就是 l_（偏移 16，含对象头）
+//   策略：枚举 LuaState 的【全部静态字段】→ 逐个读 → 凡是指向「klass==LuaState」的对象
+//         就认定是 LuaState 实例 → 读 +offL 得到 lua_State*
+//   klass 校验（*(void**)obj == kLS）是零风险的合法性判定，绝不会误读野指针。
+static int g_luaInstFound = 0;
+
 static lua_State *mx_lua_state_via_reflection(void) {
     if (!mx_il2cpp_load() || !mx_lua_load()) return NULL;
-
-    Il2CppClass *kSvr = mx_class("SLua", "LuaSvr");
-    Il2CppClass *kLS  = mx_class("SLua", "LuaState");
-    Il2CppClass *kObj = mx_class("UnityEngine", "Object");
-    if (!kSvr || !kLS || !kObj) {
-        static int s1 = 0;
-        if (++s1 <= 3) mlog(@"luaState: class missing (Svr=%p LS=%p Obj=%p)", kSvr, kLS, kObj);
+    Il2CppClass *kLS = mx_class("SLua", "LuaState");
+    if (!kLS) {
+        static int s0 = 0; if (++s0 <= 3) mlog(@"luaState: SLua.LuaState class NOT FOUND");
         return NULL;
     }
-
-    // --- 方案1：FindObjectOfType(Type) ---
-    void *inst = NULL;
-    if (I.class_get_type && I.type_get_object) {
-        Il2CppMethodInfo *miFind = mx_meth(kObj, "FindObjectOfType", 1);
-        Il2CppMethodInfo *miFind2 = miFind ? NULL : mx_meth(kObj, "FindFirstObjectOfType", 1);
-        if (!miFind) miFind = miFind2;
-        if (miFind) {
-            void *typeObj = I.type_get_object(I.class_get_type(kSvr));
-            if (typeObj) {
-                void *args[1] = { typeObj };
-                void *exc = NULL;
-                if (I.thread_current && !I.thread_current() && I.thread_attach)
-                    I.thread_attach(I.domain_get());
-                inst = I.runtime_invoke(miFind, NULL, args, &exc);
-                static int s2 = 0;
-                if (++s2 <= 3) mlog(@"luaState: FindObjectOfType(LuaSvr) -> %p exc=%p", inst, exc);
-            }
-        } else {
-            static int s3 = 0;
-            if (++s3 <= 3) mlog(@"luaState: FindObjectOfType method NOT found");
-        }
+    size_t offL = mx_field_off(kLS, "l_", NULL);
+    if (offL == (size_t)-1 || offL > 4096) {
+        static int s1 = 0; if (++s1 <= 3) mlog(@"luaState: field l_ offset bad (%zd)", (ssize_t)offL);
+        return NULL;
     }
+    if (!I.class_get_fields || !I.field_get_name || !I.field_static_get_value) return NULL;
 
-    // --- 方案2：LuaState 静态字段 statemap / main ---
-    if (!inst) {
-        // statemap 是 Dictionary<IntPtr,LuaState>；main 是 LuaState（部分版本为静态）
-        size_t offMain = mx_field_off(kLS, "main", NULL);
-        static int s4 = 0;
-        if (offMain != (size_t)-1 && offMain < 4096) {
-            void *sfd = I.class_get_static_field_data ? I.class_get_static_field_data(kLS) : NULL;
-            if (sfd) {
-                void *maybe = *(void **)((char *)sfd + offMain);
-                if (++s4 <= 3) mlog(@"luaState: static 'main' @off=%zu -> %p", offMain, maybe);
+    // 枚举全部字段，挑静态的读
+    void *it = NULL; Il2CppFieldInfo *f; int guard = 0;
+    int triedStatic = 0;
+    while ((f = I.class_get_fields(kLS, &it)) != NULL && guard++ < 256) {
+        const char *fn = I.field_get_name(f);
+        if (!fn) continue;
+        if (!strcmp(fn, "l_") || !strcmp(fn, "mainThread")) continue;
+        uint32_t fl = I.field_get_flags ? I.field_get_flags(f) : 0;
+        // FIELD_ATTRIBUTE_STATIC = 0x0010
+        if (!(fl & 0x0010)) continue;
+        triedStatic++;
+        void *val = NULL;
+        I.field_static_get_value(f, &val);
+        if (!val) continue;
+        if (!mx_ptr_plausible((uintptr_t)val)) continue;
+        // ⭐ klass 校验：对象头第一个指针必须等于 LuaState 的 Il2CppClass*
+        void *k = *(void **)val;
+        if (k != (void *)kLS) {
+            if (g_luaInstFound < 3) {
+                mlog(@"luaState: static '%s' -> %p (not LuaState, klass=%p)", fn, val, k);
+                g_luaInstFound++;
             }
+            continue;
         }
+        // 确认是 LuaState 实例
+        lua_State *Ls = *(lua_State **)((char *)val + offL);
+        mlog(@"luaState: FOUND via static '%s' obj=%p -> L=%p", fn, val, Ls);
+        if (Ls) return Ls;
     }
+    static int s2 = 0;
+    if (++s2 <= 3) mlog(@"luaState: no LuaState instance among %d static fields", triedStatic);
 
-    // --- 取 lua_State* ---
-    size_t offLS = mx_field_off(kSvr, "luaState", NULL);
-    size_t offL  = mx_field_off(kLS,  "l_",       NULL);
-    static int s5 = 0;
-    if (++s5 <= 3)
-        mlog(@"luaState: offsets Svr.luaState=%zd LS.l_=%zd inst=%p",
-             (ssize_t)offLS, (ssize_t)offL, inst);
-    if (inst && offLS != (size_t)-1 && offLS < 4096) {
-        void *lsObj = *(void **)((char *)inst + offLS);
-        if (lsObj && offL != (size_t)-1 && offL < 4096) {
-            lua_State *L = *(lua_State **)((char *)lsObj + offL);
-            if (L) return L;
+    // 兜底：statemap 是 Dictionary<IntPtr,LuaState>，扫描其内部数组找 LuaState 对象
+    {
+        Il2CppFieldInfo *fsm = NULL;
+        void *it2 = NULL; Il2CppFieldInfo *ff; int g2 = 0;
+        while ((ff = I.class_get_fields(kLS, &it2)) != NULL && g2++ < 256) {
+            const char *fn = I.field_get_name(ff);
+            if (fn && !strcmp(fn, "statemap")) { fsm = ff; break; }
+        }
+        if (fsm) {
+            uint32_t fl = I.field_get_flags ? I.field_get_flags(fsm) : 0;
+            void *dict = NULL;
+            if (fl & 0x0010) I.field_static_get_value(fsm, &dict);
+            if (dict && mx_ptr_plausible((uintptr_t)dict)) {
+                mlog(@"luaState: statemap dict=%p, scanning for LuaState instances", dict);
+                // 在字典对象前 4KB 内扫描指向 LuaState 实例的指针（entries 数组就在这里）
+                for (int off = 16; off < 4096; off += 8) {
+                    void *p2 = *(void **)((char *)dict + off);
+                    if (!p2 || !mx_ptr_plausible((uintptr_t)p2)) continue;
+                    if (*(void **)p2 != (void *)kLS) continue;
+                    lua_State *Ls = *(lua_State **)((char *)p2 + offL);
+                    if (Ls) { mlog(@"luaState: FOUND in statemap @+%d obj=%p L=%p", off, p2, Ls); return Ls; }
+                }
+            }
         }
     }
     return NULL;
