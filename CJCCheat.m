@@ -1032,13 +1032,50 @@ static void mx_inject_lua(lua_State *Ls) {
     L.createtable(Ls, 0, 2);
     int sIdx = base + 1;
 
-    // [2] S.__index = _G（让 chunk 能读 require/pairs/string/table...）
-    L.getglobal(Ls, "_G");
-    if (L.type(Ls, -1) == 5) {
-        L.setfield(Ls, sIdx, "__index");            // 绝对下标，无歧义
+    // [2] 组装自足沙箱 —— ⚠️ 不能依赖 _G 的 __index！
+    //     实测：栈操作全对、chunk type=6，但 pcallk 报
+    //       "attempt to call a nil value" / "attempt to call a string value"
+    //     → 游戏的 _G 被加固，经元方法读到的是【代理值】而不是真函数。
+    //     解法：从 registry 的真实全局表 (LUA_RIDX_GLOBALS=2) 用 rawget 绕过元方法，
+    //           把标准库【显式复制】进沙箱。
+    #define LUA_REGISTRYINDEX_C (-1001000)
+    #define LUA_RIDX_GLOBALS_C 2
+    if (L.rawgeti && L.rawget && L.pushstring) {
+        L.rawgeti(Ls, LUA_REGISTRYINDEX_C, LUA_RIDX_GLOBALS_C);   // 真实全局表
+        int gtIdx = L.gettop(Ls);
+        if (L.type(Ls, gtIdx) == 5) {
+            static const char *need[] = {
+                "pcall","xpcall","type","tostring","tonumber","pairs","ipairs","next",
+                "select","error","assert","rawget","rawset","rawequal","rawlen",
+                "setmetatable","getmetatable","require","load","string","table","math",
+                "os","io","debug","package","utf8","collectgarbage"
+            };
+            int copied = 0;
+            for (size_t i = 0; i < sizeof(need)/sizeof(need[0]); i++) {
+                // 先试 rawget（绕过 __index 加固）
+                L.pushstring(Ls, need[i]);
+                L.rawget(Ls, gtIdx);                  // -> [S][GT][v]
+                if (L.type(Ls, -1) == 0 && L.getfield) {
+                    L.settop(Ls, -1);
+                    L.pushstring(Ls, need[i]);
+                    L.getfield(Ls, gtIdx, need[i]);    // 回落：走元方法
+                }
+                if (L.type(Ls, -1) != 0) {
+                    L.pushstring(Ls, need[i]);         // -> [S][GT][v][name]
+                    L.pushvalue(Ls, -2);               // 复制 v -> [S][GT][v][name][v]
+                    L.rawset(Ls, sIdx);                // S[name]=v -> [S][GT][v]
+                    copied++;
+                }
+                L.settop(Ls, -1);                      // -> [S][GT]
+            }
+            mlog(@"lua: sandbox stdlib copied %d/%zu from registry globals",
+                 copied, sizeof(need)/sizeof(need[0]));
+        } else {
+            mlog(@"lua: registry[2] type=%d (not table)", L.type(Ls, gtIdx));
+        }
+        L.settop(Ls, -1);                            // 弹掉真实全局表
     } else {
-        mlog(@"lua: _G type=%d (not table)", L.type(Ls, -1));
-        L.settop(Ls, -1);
+        mlog(@"lua: cannot access registry globals (rawgeti/rawget missing)");
     }
     mlog(@"lua: stack after sandbox: top=%d (expect %d)", L.gettop(Ls), sIdx);
 
