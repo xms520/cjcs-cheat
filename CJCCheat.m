@@ -336,14 +336,22 @@ static int mx_il2cpp_load(void) {
         {"_il2cpp_image_get_filename",         (void **)&I.image_get_filename},
         {"_il2cpp_image_get_class",            (void **)&I.image_get_class},
         {"_il2cpp_class_get_static_field_data",(void **)&I.class_get_static_field_data},
-        {"_il2cpp_class_init",                 (void **)&I.class_init},
+        {"_il2cpp_runtime_class_init",         (void **)&I.class_init},
     };
-    int miss = 0;
+    int miss = 0, optional_miss = 0;
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
         *t[i].p = mx_sym_find(t[i].n);
-        if (!*t[i].p) { mlog(@"il2cpp: MISSING %s", t[i].n); miss++; }
+        if (!*t[i].p) {
+            // class_init / image_get_filename 等属可选 API，缺了不致命
+            int optional = (!strcmp(t[i].n, "_il2cpp_runtime_class_init") ||
+                            !strcmp(t[i].n, "_il2cpp_image_get_filename") ||
+                            !strcmp(t[i].n, "_il2cpp_image_get_name"));
+            if (optional) { optional_miss++; mlog(@"il2cpp: optional MISSING %s", t[i].n); }
+            else { miss++; mlog(@"il2cpp: MISSING %s", t[i].n); }
+        }
     }
-    if (miss) { mlog(@"il2cpp: %d/%zu missing -> abort", miss, sizeof(t)/sizeof(t[0])); return 0; }
+    if (miss) { mlog(@"il2cpp: %d/%zu required missing -> abort", miss, sizeof(t)/sizeof(t[0])); return 0; }
+    if (optional_miss) mlog(@"il2cpp: %d optional missing (ok)", optional_miss);
     ok = 1;
     mlog(@"il2cpp: %zu API resolved from in-memory symtab", sizeof(t)/sizeof(t[0]));
     return 1;
@@ -547,22 +555,53 @@ static Il2CppMethodInfo *g_timeSetScale = NULL;
 static Il2CppMethodInfo *g_timeGetScale = NULL;
 static void mx_time_warmup(void) {
     Il2CppClass *k = mx_class("UnityEngine", "Time");
-    if (!k) { mlog(@"Time class NOT FOUND"); return; }
+    if (!k) {
+        // 列出所有 image 名，便于判断是 image 没加载还是类名不同
+        if (I.domain_get && I.domain_get_assemblies && I.image_get_name) {
+            size_t n = 0;
+            Il2CppImage *imgs = (Il2CppImage *)I.domain_get_assemblies(I.domain_get(), &n);
+            mlog(@"Time class NOT FOUND; %zu images loaded:", n);
+            for (size_t i = 0; i < n && i < 40; i++) {
+                if (!imgs[i]) continue;
+                const char *nm = I.image_get_name((Il2CppImage)imgs[i]);
+                if (nm) mlog(@"   image[%zu] %s", i, nm);
+            }
+        } else {
+            mlog(@"Time class NOT FOUND (no assembly enumeration available)");
+        }
+        return;
+    }
     g_timeSetScale = mx_meth(k, "set_timeScale", 1);
     g_timeGetScale = mx_meth(k, "get_timeScale", 0);
     mlog(@"Time: set_timeScale=%p get_timeScale=%p", g_timeSetScale, g_timeGetScale);
 }
 
+static int g_timeInvokeFail = 0;
 static void mx_time_apply(float mul) {
-    if (!g_timeSetScale || !I.runtime_invoke) return;
+    if (!g_timeSetScale) { mlog(@"timeScale apply skipped: methodInfo null"); return; }
+    if (!I.runtime_invoke) { mlog(@"timeScale apply skipped: runtime_invoke null"); return; }
     float v = mul;
     void *args[1] = { &v };
     void *exc = NULL;
-    if (!I.thread_current || !I.thread_current()) {
-        if (I.thread_attach) I.thread_attach(I.domain_get());
+    if (I.thread_current && !I.thread_current() && I.thread_attach)
+        I.thread_attach(I.domain_get());
+    void *r = I.runtime_invoke(g_timeSetScale, NULL, args, &exc);
+    if (exc) {
+        if (++g_timeInvokeFail <= 3) mlog(@"timeScale invoke EXCEPTION (#%d)", g_timeInvokeFail);
+    } else if (g_timeInvokeFail < 100) {
+        g_timeInvokeFail = 100;   // 标记成功
+        mlog(@"timeScale invoke ok -> %g (ret=%p)", mul, r);
     }
-    I.runtime_invoke(g_timeSetScale, NULL, args, &exc);
-    if (exc) mlog(@"timeScale invoke exception!");
+    // 读回确认（若 set 有效，get 应立即反映）
+    if (g_timeGetScale && !exc) {
+        void *gexc = NULL;
+        void *g = I.runtime_invoke(g_timeGetScale, NULL, NULL, &gexc);
+        if (!gexc && g) {
+            float back = *(float *)g;
+            if (fabsf(back - mul) > 0.01f)
+                mlog(@"timeScale READBACK MISMATCH: want %g got %g", mul, back);
+        }
+    }
 }
 
 #pragma mark - ============ 内嵌 Lua 注入源 ============
@@ -723,9 +762,42 @@ static void mx_update_replacement(void *self, void *mi) {
 static void mx_install_lua_hook(void) {
     if (!mx_il2cpp_load() || !mx_lua_load()) return;
     Il2CppClass *k = mx_class("SLua", "LuaSvr");
-    if (!k) { mlog(@"SLua.LuaSvr class NOT FOUND"); return; }
+    if (!k) {
+        // 列出所有含 "Lua" 的命名空间/类，便于下一轮精确修正
+        if (I.domain_get && I.domain_get_assemblies) {
+            size_t n = 0;
+            Il2CppImage *imgs = (Il2CppImage *)I.domain_get_assemblies(I.domain_get(), &n);
+            int listed = 0;
+            for (size_t i = 0; i < n && listed < 30; i++) {
+                if (!imgs[i]) continue;
+                size_t cc = I.image_get_class_count ? I.image_get_class_count((Il2CppImage)imgs[i]) : 0;
+                for (size_t j = 0; j < cc && listed < 30; j++) {
+                    Il2CppClass *cj = I.image_get_class ? I.image_get_class((Il2CppImage)imgs[i], j) : NULL;
+                    if (!cj) continue;
+                    const char *cn = I.class_get_name(cj);
+                    const char *cs = I.class_get_namespace(cj);
+                    if (cn && (strstr(cn, "Lua") || (cs && strstr(cs, "Lua")))) {
+                        mlog(@"   lua-class: %s.%s", cs ? cs : "", cn);
+                        listed++;
+                    }
+                }
+            }
+            if (!listed) mlog(@"   (no class name contains 'Lua')");
+        }
+        mlog(@"SLua.LuaSvr class NOT FOUND (see list above)");
+        return;
+    }
     g_updateMI = mx_meth(k, "Update", 0);
-    if (!g_updateMI) { mlog(@"LuaSvr.Update NOT FOUND"); return; }
+    if (!g_updateMI) {
+        // 退路：Start / doinit 也是「Lua 初始化完成后」的调用点
+        g_updateMI = mx_meth(k, "Start", 7);
+        if (g_updateMI) mlog(@"LuaSvr.Update missing -> fallback to Start(7)");
+        else {
+            g_updateMI = mx_meth(k, "doinit", 2);
+            if (g_updateMI) mlog(@"LuaSvr.Update/Start missing -> fallback to doinit(2)");
+        }
+    }
+    if (!g_updateMI) { mlog(@"LuaSvr Update/Start/doinit 均 NOT FOUND"); return; }
     if (!mx_layout_probe(g_updateMI)) return;
 
     uint8_t *b = (uint8_t *)g_updateMI;
