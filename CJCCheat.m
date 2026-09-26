@@ -353,7 +353,7 @@ static Il2CppImage mx_asm_image(void *asmObj) {
     return (Il2CppImage)I.assembly_get_image(asmObj);
 }
 
-static size_t mx_all_images(Il2CppImage **outImg, size_t cap) {
+static size_t mx_all_images(void **outImg, size_t cap) {
     if (!I.domain_get || !I.domain_get_assemblies || !I.assembly_get_image) return 0;
     size_t n = 0;
     void **asms = (void **)I.domain_get_assemblies(I.domain_get(), &n);
@@ -361,7 +361,7 @@ static size_t mx_all_images(Il2CppImage **outImg, size_t cap) {
     size_t k = 0;
     for (size_t i = 0; i < n && k < cap; i++) {
         Il2CppImage im = mx_asm_image(asms[i]);
-        if (im) outImg[k++] = im;
+        if (im) outImg[k++] = (void *)im;
     }
     return k;
 }
@@ -441,7 +441,7 @@ static int mx_il2cpp_load(void) {
 static Il2CppImage mx_image_by_name(const char *want) {
     if (!I.image_get_name) return NULL;
     Il2CppImage imgs[256];
-    size_t n = mx_all_images(imgs, 256);
+    size_t n = mx_all_images((void **)imgs, 256);
     for (size_t i = 0; i < n; i++) {
         const char *nm = I.image_get_name(imgs[i]);
         if (nm && !strcmp(nm, want)) return imgs[i];
@@ -454,7 +454,7 @@ static Il2CppImage mx_image_by_name(const char *want) {
 static Il2CppClass *mx_class(const char *ns, const char *name) {
     if (!mx_il2cpp_load()) return NULL;
     Il2CppImage imgs[256];
-    size_t n = mx_all_images(imgs, 256);
+    size_t n = mx_all_images((void **)imgs, 256);
     for (size_t i = 0; i < n; i++) {
         Il2CppClass *c = I.class_from_name(imgs[i], ns, name);
         if (c) return c;
@@ -610,11 +610,14 @@ static int mx_lua_load(void) {
 static Il2CppMethodInfo *g_timeSetScale = NULL;
 static Il2CppMethodInfo *g_timeGetScale = NULL;
 static void mx_time_warmup(void) {
+    static int s_tried = 0;
+    if (g_timeSetScale || s_tried) return;
+    s_tried = 1;
     Il2CppClass *k = mx_class("UnityEngine", "Time");
     if (!k) {
         // 列出所有 image 名，便于判断是 image 没加载还是类名不同
         Il2CppImage _imgs[256];
-        size_t n = mx_all_images(_imgs, 256);
+        size_t n = mx_all_images((void **)_imgs, 256);
         if (n && I.image_get_name) {
             mlog(@"Time class NOT FOUND; %zu images loaded:", n);
             for (size_t i = 0; i < n && i < 40; i++) {
@@ -815,12 +818,15 @@ static void mx_update_replacement(void *self, void *mi) {
 }
 
 static void mx_install_lua_hook(void) {
+    // ⚠️ 必须幂等：重复替换 methodPointer 会把 g_updateOrig 指向我们自己 → 无限递归
+    static int s_luaHookInstalled = 0;
+    if (s_luaHookInstalled) return;
     if (!mx_il2cpp_load() || !mx_lua_load()) return;
     Il2CppClass *k = mx_class("SLua", "LuaSvr");
     if (!k) {
         // 列出所有含 "Lua" 的命名空间/类，便于下一轮精确修正
         Il2CppImage _imgs[256];
-        size_t n = mx_all_images(_imgs, 256);
+        size_t n = mx_all_images((void **)_imgs, 256);
         if (n) {
             int listed = 0;
             for (size_t i = 0; i < n && listed < 30; i++) {
@@ -862,6 +868,7 @@ static void mx_install_lua_hook(void) {
         return;
     }
     *slot = (void *)mx_update_replacement;
+    s_luaHookInstalled = 1;
     mlog(@"LuaSvr.Update IMP swapped: %p -> %p", (void *)g_updateOrig, (void *)mx_update_replacement);
 }
 
@@ -886,7 +893,7 @@ static void *mx_sym_find(const char *name);
 static int   mx_il2cpp_load(void);
 static int   mx_lua_load(void);
 static Il2CppClass *mx_class(const char *ns, const char *name);
-static size_t mx_all_images(Il2CppImage **outImg, size_t cap);
+static size_t mx_all_images(void **outImg, size_t cap);
 static Il2CppImage mx_asm_image(void *asmObj);
 static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
 static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
@@ -1186,7 +1193,7 @@ static void mx_stage(void) {
                 mlog(@"stageC: domain=%p", dom);
                 mx_setstep(5);            // image-enum
                 Il2CppImage _im[256];
-                size_t _n = mx_all_images(_im, 256);
+                size_t _n = mx_all_images((void **)_im, 256);
                 mlog(@"stageC: %zu images available", _n);
                 mx_setstep(0);
                 break;
@@ -1207,16 +1214,6 @@ static void mx_stage(void) {
                 mx_install_lua_hook();
                 mx_setstep(0);
                 mx_apply_speed();
-                break;
-            }
-            default: {
-                g_ctorStage = 3;
-                mlog(@"stage3: luaInjected=%d timeSet=%p timeGet=%p",
-                     g_luaInjected, g_timeSetScale, g_timeGetScale);
-                if (g_luaInjected) mx_dump_found();
-                // 确保加速被持续应用（LuaSvr tween 可能改回 timeScale）
-                mx_apply_speed();
-                if (g_luaInjected) g_ctorStage = 99;  // 停止重试
                 break;
             }
             }
