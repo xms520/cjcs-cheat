@@ -469,6 +469,14 @@ typedef struct {
     int      nameOff;   // name 偏移
     int      klassOff;  // klass 偏移
 } mx_mi_layout_t;
+static int mx_ptr_plausible(uintptr_t p) {
+    if (p < 0x1000) return 0;
+    const struct mach_header_64 *mh = mx_unity_header();
+    if (!mh) return 0;
+    uintptr_t base = (uintptr_t)mh;
+    return (p >= base && p < base + kUnityTextSize);
+}
+
 static mx_mi_layout_t g_mi = { -1, -1, -1 };
 
 // 校验一个 MethodInfo 是否可信：布局已知 + name 字段指向的字符串等于期望名
@@ -533,13 +541,6 @@ static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **o
 // ⚠️ 不同 il2cpp 版本 MethodInfo 布局不同（2022+ 多了 virtualMethodPointer）。
 // 用「name 字段里必须是 'Update'」来唯一确定布局，而不是硬编码偏移。
 
-static int mx_ptr_plausible(uintptr_t p) {
-    if (p < 0x1000) return 0;
-    const struct mach_header_64 *mh = mx_unity_header();
-    if (!mh) return 0;
-    uintptr_t base = (uintptr_t)mh;
-    return (p >= base && p < base + kUnityTextSize);
-}
 
 // ⭐ 自洽法：不猜偏移。用 il2cpp_method_get_name(mi) 拿到名字字符串的真实地址，
 //    再在 mi 的前 128 字节里找哪个 8 字节字段等于这个地址 → 那就是 nameOff。
