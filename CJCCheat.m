@@ -1114,6 +1114,7 @@ static void mx_install_lua_hook(void) {
 }
 
 #pragma mark - ============ 主线程 Lua 注入 tick（走反射，不用 hook）============
+static void mx_dump_found(void);   // 定义在文件后部
 static void mx_lua_tick_inject(void) {
     static int s_try = 0;
     if (g_luaInjected) return;
@@ -1147,7 +1148,6 @@ static void mx_apply_speed(void) {
 
 #pragma mark - ============ 前置声明 ============
 static void  mx_ensure_overlay(void);
-static void  mx_dump_found(void);
 static void  mx_apply_speed(void);
 static void  mx_time_warmup(void);
 static void  mx_time_apply(float mul);
