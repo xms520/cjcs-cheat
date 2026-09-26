@@ -642,6 +642,7 @@ static struct {
     void           (*pushstring)(lua_State *, const char *);
     void           (*pushboolean)(lua_State *, int);
     void           (*setfield)(lua_State *, int, const char *);
+    void           (*getfield)(lua_State *, int, const char *);
     const char*    (*tolstring)(lua_State *, int, size_t *);
     int            (*type)(lua_State *, int);
     void           (*createtable)(lua_State *, int, int);
@@ -673,6 +674,7 @@ static int mx_lua_load(void) {
         {"_lua_pushstring",   (void **)&L.pushstring},
         {"_lua_pushboolean",  (void **)&L.pushboolean},
         {"_lua_setfield",     (void **)&L.setfield},
+        {"_lua_getfield",     (void **)&L.getfield},
         {"_lua_tolstring",    (void **)&L.tolstring},
         {"_lua_type",         (void **)&L.type},
         {"_lua_createtable",  (void **)&L.createtable},
