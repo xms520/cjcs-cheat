@@ -336,6 +336,8 @@ typedef struct {
     void*             (*thread_current)(void);
     void              (*gc_disable)(void);
     void*             (*class_get_property_from_name)(Il2CppClass *, const char *);
+    void*             (*class_get_type)(Il2CppClass *);
+    void*             (*type_get_object)(void *type);
     size_t            (*image_get_class_count)(Il2CppImage);
     Il2CppClass*      (*image_get_class)(Il2CppImage, size_t);
     const char*       (*image_get_name)(Il2CppImage);
@@ -405,6 +407,8 @@ static int mx_il2cpp_load(void) {
         {"_il2cpp_class_get_static_field_data",(void **)&I.class_get_static_field_data},
         {"_il2cpp_runtime_class_init",         (void **)&I.class_init},
         {"_il2cpp_class_get_property_from_name",(void **)&I.class_get_property_from_name},
+        {"_il2cpp_class_get_type",             (void **)&I.class_get_type},
+        {"_il2cpp_type_get_object",            (void **)&I.type_get_object},
     };
     int miss = 0, optional_miss = 0, outrange = 0;
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
@@ -881,6 +885,81 @@ static const char *kLuaHook =
 "end\n"
 "FOUND[#FOUND+1] = 'modules=' .. #keys .. ' wrapped=' .. wrapped\n";
 
+#pragma mark - ============ 纯反射获取 lua_State（不 hook，最可靠）============
+// ⚠️ 实测教训：改 SLua.LuaSvr.Update 的 methodPointer 对外部调用【完全无效】——
+//    Unity 的托管→托管调用是编译期直连（方法指针已被内联进调用点），
+//    日志里 LuaSvr.Update IMP swapped 打了，但替换后的函数一次都没被调用。
+// 正解：完全不 hook。用 il2cpp 反射在【主线程】直接拿到 LuaSvr 实例 → lua_State：
+//    UnityEngine.Object.FindObjectOfType(Type) → SLua.LuaSvr 实例
+//      → 读字段 luaState (SLua.LuaState 对象)
+//        → 读字段 l_ (lua_State*)
+// 主线程 tick 里 Lua 不在执行中，注入最安全。
+static lua_State *mx_lua_state_via_reflection(void) {
+    if (!mx_il2cpp_load() || !mx_lua_load()) return NULL;
+
+    Il2CppClass *kSvr = mx_class("SLua", "LuaSvr");
+    Il2CppClass *kLS  = mx_class("SLua", "LuaState");
+    Il2CppClass *kObj = mx_class("UnityEngine", "Object");
+    if (!kSvr || !kLS || !kObj) {
+        static int s1 = 0;
+        if (++s1 <= 3) mlog(@"luaState: class missing (Svr=%p LS=%p Obj=%p)", kSvr, kLS, kObj);
+        return NULL;
+    }
+
+    // --- 方案1：FindObjectOfType(Type) ---
+    void *inst = NULL;
+    if (I.class_get_type && I.type_get_object) {
+        Il2CppMethodInfo *miFind = mx_meth(kObj, "FindObjectOfType", 1);
+        Il2CppMethodInfo *miFind2 = miFind ? NULL : mx_meth(kObj, "FindFirstObjectOfType", 1);
+        if (!miFind) miFind = miFind2;
+        if (miFind) {
+            void *typeObj = I.type_get_object(I.class_get_type(kSvr));
+            if (typeObj) {
+                void *args[1] = { typeObj };
+                void *exc = NULL;
+                if (I.thread_current && !I.thread_current() && I.thread_attach)
+                    I.thread_attach(I.domain_get());
+                inst = I.runtime_invoke(miFind, NULL, args, &exc);
+                static int s2 = 0;
+                if (++s2 <= 3) mlog(@"luaState: FindObjectOfType(LuaSvr) -> %p exc=%p", inst, exc);
+            }
+        } else {
+            static int s3 = 0;
+            if (++s3 <= 3) mlog(@"luaState: FindObjectOfType method NOT found");
+        }
+    }
+
+    // --- 方案2：LuaState 静态字段 statemap / main ---
+    if (!inst) {
+        // statemap 是 Dictionary<IntPtr,LuaState>；main 是 LuaState（部分版本为静态）
+        size_t offMain = mx_field_off(kLS, "main", NULL);
+        static int s4 = 0;
+        if (offMain != (size_t)-1 && offMain < 4096) {
+            void *sfd = I.class_get_static_field_data ? I.class_get_static_field_data(kLS) : NULL;
+            if (sfd) {
+                void *maybe = *(void **)((char *)sfd + offMain);
+                if (++s4 <= 3) mlog(@"luaState: static 'main' @off=%zu -> %p", offMain, maybe);
+            }
+        }
+    }
+
+    // --- 取 lua_State* ---
+    size_t offLS = mx_field_off(kSvr, "luaState", NULL);
+    size_t offL  = mx_field_off(kLS,  "l_",       NULL);
+    static int s5 = 0;
+    if (++s5 <= 3)
+        mlog(@"luaState: offsets Svr.luaState=%zd LS.l_=%zd inst=%p",
+             (ssize_t)offLS, (ssize_t)offL, inst);
+    if (inst && offLS != (size_t)-1 && offLS < 4096) {
+        void *lsObj = *(void **)((char *)inst + offLS);
+        if (lsObj && offL != (size_t)-1 && offL < 4096) {
+            lua_State *L = *(lua_State **)((char *)lsObj + offL);
+            if (L) return L;
+        }
+    }
+    return NULL;
+}
+
 #pragma mark - ============ LuaSvr.Update 挂钩（methodPointer 热替换，非内联）============
 static Il2CppMethodInfo *g_updateMI   = NULL;
 static void            (*g_updateOrig)(void *self, void *mi) = NULL;
@@ -1034,6 +1113,28 @@ static void mx_install_lua_hook(void) {
     mlog(@"LuaSvr.Update IMP swapped: %p -> %p", (void *)g_updateOrig, (void *)mx_update_replacement);
 }
 
+#pragma mark - ============ 主线程 Lua 注入 tick（走反射，不用 hook）============
+static void mx_lua_tick_inject(void) {
+    static int s_try = 0;
+    if (g_luaInjected) return;
+    s_try++;
+    if (s_try > 120) return;               // 最多试 120 次（~2min）
+    if (s_try % 10 != 1) return;           // 每 10 次才真跑一遍（省开销）
+
+    lua_State *Ls = mx_lua_state_via_reflection();
+    if (!Ls) {
+        if (s_try <= 3) mlog(@"lua tick: state not ready (try %d)", s_try);
+        return;
+    }
+    if (!g_L) g_L = Ls;
+    mx_inject_lua(Ls);
+
+    if (g_luaInjected) {
+        mlog(@"lua tick: injection DONE (try %d)", s_try);
+        mx_dump_found();
+    }
+}
+
 #pragma mark - ============ 全局加速应用 tick ============
 
 static void mx_apply_speed(void) {
@@ -1061,6 +1162,7 @@ static Il2CppImage mx_asm_image(void *asmObj);
 static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
 static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
 static int   mx_layout_learn(Il2CppMethodInfo *mi, Il2CppClass *klass, const char *expectName);
+static void  mx_lua_tick_inject(void);
 static int   mx_ptr_plausible(uintptr_t p);
 static int   mx_ptr_executable(uintptr_t p);
 static const struct mach_header_64 *mx_unity_header(void);
@@ -1184,6 +1286,7 @@ static CJBox *g_box = nil;
         @try {
             mx_ensure_overlay();
             mx_apply_speed();
+            mx_lua_tick_inject();
         } @catch (NSException *e) { mlog(@"keepTick exc %@", e.name); }
     }
 }
@@ -1375,7 +1478,7 @@ static void mx_stage(void) {
                 // 阶段E：Lua 注入
                 g_ctorStage = 5;
                 mx_setstep(8);            // lua-class
-                mx_install_lua_hook();
+                mx_lua_tick_inject();     // 主线程反射注入（不依赖 hook）
                 mx_setstep(0);
                 mx_apply_speed();
                 break;
@@ -1413,7 +1516,7 @@ static void mx_dump_found(void) {
 }
 
 #pragma mark - UI tick（1s）
-static void mx_ui_tick(void) { @autoreleasepool { @try { mx_ensure_overlay(); mx_apply_speed(); } @catch (NSException *e) {} } }
+static void mx_ui_tick(void) { @autoreleasepool { @try { mx_ensure_overlay(); mx_apply_speed(); mx_lua_tick_inject(); } @catch (NSException *e) {} } }
 
 static void cjcs_boot(void);
 
