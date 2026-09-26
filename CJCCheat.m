@@ -1013,72 +1013,108 @@ static size_t g_off_l       = (size_t)-1;    // SLua.LuaState.l_
 //     S.__index = _G      （读落到游戏全局表 → 能访问 require/pairs/string 等）
 //     S 自身可写          （我们的写入不受 __newindex 影响）
 //   这样 chunk 内的一切全局操作都在我们自己的表上完成。
+// ⭐ 版本演进（全部来自真机日志）：
+//   v1 直接 loadbufferx+pcallk            → "variable '__CJCS_INSTALLED' is not declared"
+//   v2 把 chunk 的 _ENV 设成 _G           → 同上（游戏全局表有 __newindex 加固）
+//   v3 自建沙箱表当 _ENV                  → "attempt to call a table value"
+//      ↑ 说明沙箱思路对了，但【栈上 chunk 的位置取错】——pcallk 把表当函数调了
+//   v4（本版）：把所有下标都基于【函数内 gettop 实测的 base】重新计算，
+//              并在 pcallk 之前用 lua_type 断言栈顶确实是函数（不是表）。
 static void mx_inject_lua(lua_State *Ls) {
     if (!Ls || !mx_lua_load()) return;
-    if (!L.getglobal || !L.setupvalue) { mlog(@"lua: missing getglobal/setupvalue"); return; }
+    if (!L.getglobal || !L.setupvalue || !L.type) { mlog(@"lua: missing core API"); return; }
+
+    // 绝对基准：进入时的栈顶
     int base = L.gettop(Ls);
+    mlog(@"lua: inject begin, base=%d", base);
 
-    // 1) 自建沙箱表 (0,2)
+    // [1] 沙箱表 S  ->  base+1
     L.createtable(Ls, 0, 2);
+    int sIdx = base + 1;
 
-    // 2) S.__index = _G   — 让 chunk 能读到游戏全局（require / string / pairs ...）
-    if (L.getglobal && L.setfield) {
+    // [2] S.__index = _G（让 chunk 能读 require/pairs/string/table...）
+    L.getglobal(Ls, "_G");
+    if (L.type(Ls, -1) == 5) {
+        L.setfield(Ls, sIdx, "__index");            // 绝对下标，无歧义
+    } else {
+        mlog(@"lua: _G type=%d (not table)", L.type(Ls, -1));
+        L.settop(Ls, -1);
+    }
+    mlog(@"lua: stack after sandbox: top=%d (expect %d)", L.gettop(Ls), sIdx);
+
+    // [3] 加载 chunk ->  base+2
+    int rc = L.L_loadbufferx(Ls, kLuaHook, strlen(kLuaHook), "@cjcs_hook", "t");
+    int top = L.gettop(Ls);
+    mlog(@"lua: loadbufferx rc=%d top=%d", rc, top);
+    if (rc != 0 || top < sIdx + 1) {
+        const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
+        mlog(@"lua: load FAILED (%s)", e ? e : "?");
+        L.settop(Ls, base);
+        return;
+    }
+    // ⚠️ 断言：栈顶必须是函数(6)，否则 pcallk 会报 "attempt to call a table value"
+    int chunkType = L.type(Ls, top);
+    mlog(@"lua: chunk type=%d (6=function, want 6)", chunkType);
+    if (chunkType != 6) {
+        mlog(@"lua: top slot is NOT a function -> abort");
+        L.settop(Ls, base);
+        return;
+    }
+
+    // [3.5] 先把沙箱表挂到 _G（用 rawset 绕过 __newindex）→ 便于执行后回读
+    if (L.rawset && L.pushstring && L.pushvalue) {
         L.getglobal(Ls, "_G");
         if (L.type(Ls, -1) == 5) {
-            L.setfield(Ls, -2, "__index");          // S.__index = _G
-        } else {
-            L.settop(Ls, -1);                       // 弹掉非表值
-            mlog(@"lua: _G is not a table (type=%d) -> sandbox has no __index", L.type(Ls, -1));
+            L.pushstring(Ls, "__CJCS_SANDBOX");
+            L.pushvalue(Ls, sIdx);          // 复制 S（绝对下标）
+            L.rawset(Ls, -3);
+            mlog(@"lua: sandbox published to _G via rawset");
         }
+        L.settop(Ls, -1);
     }
 
-    // 3) 加载 chunk → 栈: [S][chunk]
-    if (L.L_loadbufferx(Ls, kLuaHook, strlen(kLuaHook), "@cjcs_hook", "t") != 0) {
+    // [4] chunk 的 _ENV(upvalue#1) = S
+    const char *up = L.setupvalue(Ls, top, 1);
+    mlog(@"lua: setupvalue -> %s", up ? up : "(null)");
+
+    // [5] 执行  func=chunk, nargs=0, nresults=-1
+    //     pcallk 的 funcidx 语义基于调用瞬间的栈：chunk 此时位于 top
+    int prc = L.pcallk(Ls, top, -1, 0, 0, NULL);
+    if (prc != 0) {
         const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
-        mlog(@"lua: loadbufferx FAILED: %s", e ? e : "?");
+        mlog(@"lua: pcallk FAILED (rc=%d): %s", prc, e ? e : "?");
         L.settop(Ls, base);
         return;
     }
+    L.settop(Ls, base);
 
-    // 4) chunk 的 _ENV(upvalue#1) = S   栈: [S][chunk(ENV=S)]
-    const char *up = L.setupvalue(Ls, -1, 1);
-    mlog(@"lua: sandbox _ENV set (upvalue=%s)", up ? up : "(null)");
-
-    // 5) 执行
-    if (L.pcallk(Ls, 0, -1, 0, 0, NULL) != 0) {
-        const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
-        mlog(@"lua: pcallk FAILED: %s", e ? e : "?");
-        L.settop(Ls, base);
-        return;
-    }
-    // 栈: [S]
-    // 6) 回读：用 rawget 直接查沙箱表（完全绕开元方法）
+    // [6] 用 rawget 回读沙箱表（完全绕开元方法）
     int okFlag = 0, foundType = -999;
-    if (L.rawget && L.pushstring) {
-        L.pushstring(Ls, "__CJCS_INSTALLED");
-        L.rawget(Ls, -2);                     // S["__CJCS_INSTALLED"]
-        okFlag = (L.type(Ls, -1) == 1) ? 1 : 0;
-        L.settop(Ls, -1);
-        L.pushstring(Ls, "__CJCS_FOUND");
-        L.rawget(Ls, -2);
-        foundType = L.type(Ls, -1);
-        L.settop(Ls, -1);
-    }
-    // 7) 把沙箱表存进游戏全局表（用 _G 的 rawset 绕过 __newindex）
-    if (L.getglobal && L.rawset) {
-        L.pushstring(Ls, "__CJCS_SANDBOX");
-        L.pushvalue(Ls, -2);                  // 复制 S
-        L.rawset(Ls, -3);                     // _G["__CJCS_SANDBOX"] = S
-        // 同时尝试常规 setglobal（可能被拦，失败也无所谓）
+    // S 已被 settop 弹掉，改为从 _G 里取回我们 rawset 进去的沙箱
+    // 先看 _G["__CJCS_SANDBOX"]
+    L.getglobal(Ls, "__CJCS_SANDBOX");
+    if (L.type(Ls, -1) == 5) {
+        if (L.pushstring && L.rawget) {
+            L.pushstring(Ls, "__CJCS_INSTALLED");
+            L.rawget(Ls, -2);
+            okFlag = (L.type(Ls, -1) == 1) ? 1 : 0;
+            L.settop(Ls, -1);
+            L.pushstring(Ls, "__CJCS_FOUND");
+            L.rawget(Ls, -2);
+            foundType = L.type(Ls, -1);
+            L.settop(Ls, -1);
+        }
+    } else {
+        mlog(@"lua: __CJCS_SANDBOX not in _G (type=%d) -> rawset may have failed", L.type(Ls, -1));
     }
     L.settop(Ls, base);
 
     if (!okFlag) {
-        mlog(@"lua: chunk ran but __CJCS_INSTALLED still missing (sandbox=%d)", foundType);
+        mlog(@"lua: chunk executed but globals not visible (foundType=%d)", foundType);
         return;
     }
     g_luaInjected = 1;
-    mlog(@"lua: HOOK INJECTED, sandbox ok (__CJCS_FOUND type=%d)", foundType);
+    mlog(@"lua: SANDOX OK -> __CJCS_INSTALLED set, __CJCS_FOUND type=%d", foundType);
 }
 
 static void mx_update_replacement(void *self, void *mi) {
