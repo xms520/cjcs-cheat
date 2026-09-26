@@ -464,6 +464,22 @@ static Il2CppClass *mx_class(const char *ns, const char *name) {
     return NULL;
 }
 
+typedef struct {
+    int      ptrOff;    // methodPointer 偏移
+    int      nameOff;   // name 偏移
+    int      klassOff;  // klass 偏移
+} mx_mi_layout_t;
+static mx_mi_layout_t g_mi = { -1, -1, -1 };
+
+// 校验一个 MethodInfo 是否可信：布局已知 + name 字段指向的字符串等于期望名
+static int mx_mi_valid(Il2CppMethodInfo *mi, const char *expectName) {
+    if (!mi || g_mi.nameOff < 0) return 0;
+    uintptr_t nm = *(uintptr_t *)((uint8_t *)mi + g_mi.nameOff);
+    if (!nm || !mx_ptr_plausible(nm)) return 0;
+    if (expectName && strcmp((const char *)nm, expectName)) return 0;
+    return 1;
+}
+
 static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc) {
     if (!k) return NULL;
     // 1) 正式 API（最快）
@@ -516,12 +532,6 @@ static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **o
 #pragma mark - ============ MethodInfo 布局自探测 ============
 // ⚠️ 不同 il2cpp 版本 MethodInfo 布局不同（2022+ 多了 virtualMethodPointer）。
 // 用「name 字段里必须是 'Update'」来唯一确定布局，而不是硬编码偏移。
-typedef struct {
-    int      ptrOff;    // methodPointer 偏移
-    int      nameOff;   // name 偏移
-    int      klassOff;  // klass 偏移
-} mx_mi_layout_t;
-static mx_mi_layout_t g_mi = { -1, -1, -1 };
 
 static int mx_ptr_plausible(uintptr_t p) {
     if (p < 0x1000) return 0;
@@ -572,14 +582,6 @@ static int mx_layout_learn(Il2CppMethodInfo *mi, Il2CppClass *klass, const char 
     return 1;
 }
 
-// 校验一个 MethodInfo 是否可信：布局已知 + name 字段指向的字符串等于期望名
-static int mx_mi_valid(Il2CppMethodInfo *mi, const char *expectName) {
-    if (!mi || g_mi.nameOff < 0) return 0;
-    uintptr_t nm = *(uintptr_t *)((uint8_t *)mi + g_mi.nameOff);
-    if (!nm || !mx_ptr_plausible(nm)) return 0;
-    if (expectName && strcmp((const char *)nm, expectName)) return 0;
-    return 1;
-}
 
 #pragma mark - ============ Lua C API（内存符号表，未导出但可定位）============
 typedef struct lua_State lua_State;
@@ -971,7 +973,6 @@ static Il2CppImage mx_asm_image(void *asmObj);
 static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
 static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
 static int   mx_layout_learn(Il2CppMethodInfo *mi, Il2CppClass *klass, const char *expectName);
-static int   mx_mi_valid(Il2CppMethodInfo *mi, const char *expectName);
 static int   mx_ptr_plausible(uintptr_t p);
 static const struct mach_header_64 *mx_unity_header(void);
 static void  mx_dump_found(void);
