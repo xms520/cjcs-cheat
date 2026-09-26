@@ -358,50 +358,49 @@ static int mx_il2cpp_load(void) {
 }
 
 
-// 找类：先扫全部 image（Obfuz 下 image 顺序不保证），再按名打开
-static Il2CppClass *mx_find_class(const char *ns, const char *name) {
-    if (!mx_il2cpp_load()) return NULL;
-    Il2CppDomain dom = I.domain_get();
-    size_t n = 0;
-    Il2CppImage *imgs = (Il2CppImage *)I.domain_get_assemblies(dom, &n);
-    if (imgs) {
-        for (size_t i = 0; i < n; i++) {
-            if (!imgs[i]) continue;
-            Il2CppClass *c = I.class_from_name(imgs[i], ns, name);
-            if (c) return c;
-        }
-    }
-    return NULL;
-}
 
 #pragma mark - ============ il2cpp 类/方法/字段 精确定位 ============
 static Il2CppImage mx_image_by_name(const char *want) {
-    if (!I.domain_get || !I.domain_get_assemblies || !I.image_get_name) return NULL;
-    Il2CppDomain dom = I.domain_get();
-    size_t n = 0;
-    Il2CppImage *imgs = (Il2CppImage *)I.domain_get_assemblies(dom, &n);
-    if (!imgs) return NULL;
+    if (!I.image_get_name) return NULL;
+    Il2CppImage imgs[256];
+    size_t n = mx_all_images(imgs, 256);
     for (size_t i = 0; i < n; i++) {
-        if (!imgs[i]) continue;
-        Il2CppImage im = (Il2CppImage)imgs[i];
-        const char *nm = I.image_get_name(im);
-        if (nm && !strcmp(nm, want)) return im;
+        const char *nm = I.image_get_name(imgs[i]);
+        if (nm && !strcmp(nm, want)) return imgs[i];
     }
     return NULL;
 }
 
-// Obfuz 下 image 遍历顺序不定，这里全 image 扫（并缓存结果）
+
+// ⚠️ 关键：il2cpp_domain_get_assemblies 返回的是 Il2CppAssembly**（不是 Il2CppImage**）。
+//    Il2CppAssembly 结构第一个字段才是 image，必须用 il2cpp_assembly_get_image 取。
+//    旧版把 Assembly* 直接当 Image 传给 class_from_name → 解引用垃圾 → SIGSEGV。
+static Il2CppImage mx_asm_image(void *asmObj) {
+    if (!asmObj || !I.assembly_get_image) return NULL;
+    return (Il2CppImage)I.assembly_get_image(asmObj);
+}
+
+static size_t mx_all_images(Il2CppImage **outImg, size_t cap) {
+    if (!I.domain_get || !I.domain_get_assemblies || !I.assembly_get_image) return 0;
+    size_t n = 0;
+    void **asms = (void **)I.domain_get_assemblies(I.domain_get(), &n);
+    if (!asms) return 0;
+    size_t k = 0;
+    for (size_t i = 0; i < n && k < cap; i++) {
+        Il2CppImage im = mx_asm_image(asms[i]);
+        if (im) outImg[k++] = im;
+    }
+    return k;
+}
+
+// Obfuz 下 image 遍历顺序不定 → 全 image 扫
 static Il2CppClass *mx_class(const char *ns, const char *name) {
     if (!mx_il2cpp_load()) return NULL;
-    Il2CppDomain dom = I.domain_get();
-    size_t n = 0;
-    Il2CppImage *imgs = (Il2CppImage *)I.domain_get_assemblies(dom, &n);
-    if (imgs) {
-        for (size_t i = 0; i < n; i++) {
-            if (!imgs[i]) continue;
-            Il2CppClass *c = I.class_from_name((Il2CppImage)imgs[i], ns, name);
-            if (c) return c;
-        }
+    Il2CppImage imgs[256];
+    size_t n = mx_all_images(imgs, 256);
+    for (size_t i = 0; i < n; i++) {
+        Il2CppClass *c = I.class_from_name(imgs[i], ns, name);
+        if (c) return c;
     }
     return NULL;
 }
@@ -557,13 +556,12 @@ static void mx_time_warmup(void) {
     Il2CppClass *k = mx_class("UnityEngine", "Time");
     if (!k) {
         // 列出所有 image 名，便于判断是 image 没加载还是类名不同
-        if (I.domain_get && I.domain_get_assemblies && I.image_get_name) {
-            size_t n = 0;
-            Il2CppImage *imgs = (Il2CppImage *)I.domain_get_assemblies(I.domain_get(), &n);
+        Il2CppImage _imgs[256];
+        size_t n = mx_all_images(_imgs, 256);
+        if (n && I.image_get_name) {
             mlog(@"Time class NOT FOUND; %zu images loaded:", n);
             for (size_t i = 0; i < n && i < 40; i++) {
-                if (!imgs[i]) continue;
-                const char *nm = I.image_get_name((Il2CppImage)imgs[i]);
+                const char *nm = I.image_get_name(_imgs[i]);
                 if (nm) mlog(@"   image[%zu] %s", i, nm);
             }
         } else {
@@ -764,15 +762,14 @@ static void mx_install_lua_hook(void) {
     Il2CppClass *k = mx_class("SLua", "LuaSvr");
     if (!k) {
         // 列出所有含 "Lua" 的命名空间/类，便于下一轮精确修正
-        if (I.domain_get && I.domain_get_assemblies) {
-            size_t n = 0;
-            Il2CppImage *imgs = (Il2CppImage *)I.domain_get_assemblies(I.domain_get(), &n);
+        Il2CppImage _imgs[256];
+        size_t n = mx_all_images(_imgs, 256);
+        if (n) {
             int listed = 0;
             for (size_t i = 0; i < n && listed < 30; i++) {
-                if (!imgs[i]) continue;
-                size_t cc = I.image_get_class_count ? I.image_get_class_count((Il2CppImage)imgs[i]) : 0;
+                size_t cc = I.image_get_class_count ? I.image_get_class_count(_imgs[i]) : 0;
                 for (size_t j = 0; j < cc && listed < 30; j++) {
-                    Il2CppClass *cj = I.image_get_class ? I.image_get_class((Il2CppImage)imgs[i], j) : NULL;
+                    Il2CppClass *cj = I.image_get_class ? I.image_get_class(_imgs[i], j) : NULL;
                     if (!cj) continue;
                     const char *cn = I.class_get_name(cj);
                     const char *cs = I.class_get_namespace(cj);
@@ -1109,8 +1106,18 @@ static void mx_stage(void) {
                 mx_syms_load();
                 mlog(@"sym: %u symbols indexed", g_symCount);
                 if (!mx_il2cpp_load()) { mlog(@"stage1: il2cpp API missing -> UI only"); break; }
+                mlog(@"stage1: domain=%p", I.domain_get ? I.domain_get() : NULL);
+                mlog(@"stage1: enumerating images ...");
+                {
+                    Il2CppImage _im[256];
+                    size_t _n = mx_all_images(_im, 256);
+                    mlog(@"stage1: %zu images available", _n);
+                }
+                mlog(@"stage1: time warmup ...");
                 mx_time_warmup();
+                mlog(@"stage1: lua hook install ...");
                 mx_install_lua_hook();
+                mlog(@"stage1: done");
                 break;
             }
             case 1:
