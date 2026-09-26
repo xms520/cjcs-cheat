@@ -151,60 +151,76 @@ static void mx_syms_load(void) {
 
     const struct load_command *lc = (const struct load_command *)((const char *)mh + sizeof(struct mach_header_64));
     const struct symtab_command *st = NULL;
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        if (lc->cmd == LC_SYMTAB) { st = (const struct symtab_command *)lc; break; }
-        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
-    }
-    if (!st) { mlog(@"sym: LC_SYMTAB NOT FOUND"); return; }
-
-    // __LINKEDIT 把 file offset 映射到内存（slide 后）
-    // symoff/stroff 是**文件偏移**；运行时需转成 vmaddr 再 + slide
-    // __LINKEDIT: fileoff -> vmaddr = fileoff + (vmaddr - fileoff)，实测该差值是常量
     uintptr_t linkedit_delta = 0;
-    int found = 0;
-    lc = (const struct load_command *)((const char *)mh + sizeof(struct mach_header_64));
+    int haveLE = 0;
     for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SYMTAB) st = (const struct symtab_command *)lc;
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
             if (!strcmp(sg->segname, "__LINKEDIT")) {
                 linkedit_delta = (uintptr_t)(sg->vmaddr - sg->fileoff);
-                found = 1;
-                break;
+                haveLE = 1;
             }
         }
         lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
     }
-    if (!found) { mlog(@"sym: __LINKEDIT NOT FOUND"); return; }
+    if (!st || !haveLE) { mlog(@"sym: LC_SYMTAB/__LINKEDIT NOT FOUND"); return; }
 
-    const struct nlist_64 *nl = (const struct nlist_64 *)((uintptr_t)mh + linkedit_delta + g_slide + st->symoff);
-    const char *strtab = (const char *)((uintptr_t)mh + linkedit_delta + g_slide + st->stroff);
+    // ⚠️ 关键：mh 是 _dyld_get_image_header 返回的【运行时】地址（= __TEXT.vmaddr(0) + slide），
+    //    已经含 slide。所以运行时地址 = mh + linkedit_delta + fileoff，
+    //    ★ 绝不能再 + slide（旧版这里双重加 slide → 指针飞出映射区 → SIGSEGV KERN_INVALID_ADDRESS）★
+    const struct nlist_64 *nl    = (const struct nlist_64 *)((uintptr_t)mh + linkedit_delta + st->symoff);
+    const char            *strtb = (const char *)((uintptr_t)mh + linkedit_delta + st->stroff);
+    mlog(@"sym: mh=%p slide=%#lx LE_delta=%#lx symoff=%u nsyms=%u stroff=%u strsize=%u",
+         mh, (unsigned long)g_slide, (unsigned long)linkedit_delta,
+         st->symoff, st->nsyms, st->stroff, st->strsize);
+    mlog(@"sym: nlist=%p strtab=%p", nl, strtb);
 
-    g_syms = (mx_sym_t *)calloc(st->nsyms, sizeof(mx_sym_t));
-    if (!g_syms) { mlog(@"sym: calloc failed"); return; }
-
-    // 只收「有价值的」符号：_il2cpp_ / _lua / _luaL_ / TimeManager / Time_Get_Custom
+    // 第一遍：只计数（避免 477826 * 16B ≈ 7.6MB 的大块 calloc）
+    uint32_t keep = 0;
     for (uint32_t i = 0; i < st->nsyms; i++) {
-        if (!nl[i].n_value) continue;
-        const char *nm = strtab + nl[i].n_un.n_strx;
+        uint64_t v = nl[i].n_value;
+        if (!v) continue;
+        uint32_t sx = nl[i].n_un.n_strx;
+        if (sx >= st->strsize) continue;                 // 名字越界保护
+        const char *nm = strtb + sx;
         if (nm[0] != '_') continue;
-        if (nm[1] == 'i' && !strncmp(nm, "_il2cpp_", 8)) { /* keep */ }
-        else if (!strncmp(nm, "_lua", 4)) { /* keep */ }
-        else if (!strncmp(nm, "__ZN11TimeManager", 17)) { /* keep */ }
-        else if (!strncmp(nm, "__Z", 3) && strstr(nm, "Time_Get_Custom_Prop")) { /* keep */ }
-        else if (!strncmp(nm, "__Z", 3) && strstr(nm, "Time_Set_Custom_Prop")) { /* keep */ }
-        else continue;
-        if (g_symCount >= st->nsyms) break;
-        g_syms[g_symCount].name = strdup(nm);
-        g_syms[g_symCount].addr = (uintptr_t)(nl[i].n_value + g_slide);
-        g_symCount++;
+        if (!strncmp(nm, "_il2cpp_", 8)) keep++;
+        else if (!strncmp(nm, "_lua", 4)) keep++;
+        else if (!strncmp(nm, "__ZN11TimeManager", 17)) keep++;
+        else if (!strncmp(nm, "__Z", 3) && strstr(nm, "Time_Get_Custom_Prop")) keep++;
+        else if (!strncmp(nm, "__Z", 3) && strstr(nm, "Time_Set_Custom_Prop")) keep++;
     }
-    mlog(@"sym: table built, %u symbols (nsyms=%u, slide=%#lx)", g_symCount, st->nsyms, (unsigned long)g_slide);
-    if (g_symCount == 0) return;
+    mlog(@"sym: pass1 raw=%u kept=%u", st->nsyms, keep);
+    if (!keep) { mlog(@"sym: 0 symbols matched -> abort"); return; }
 
-    // 建哈希：2 的幂，开放寻址线性探测
+    // 第二遍：精确分配 + 填充
+    g_syms = (mx_sym_t *)calloc(keep, sizeof(mx_sym_t));
+    if (!g_syms) { mlog(@"sym: calloc failed"); return; }
+    for (uint32_t i = 0; i < st->nsyms && g_symCount < keep; i++) {
+        uint64_t v = nl[i].n_value;
+        if (!v) continue;
+        uint32_t sx = nl[i].n_un.n_strx;
+        if (sx >= st->strsize) continue;
+        const char *nm = strtb + sx;
+        if (nm[0] != '_') continue;
+        int keepIt = 0;
+        if (!strncmp(nm, "_il2cpp_", 8)) keepIt = 1;
+        else if (!strncmp(nm, "_lua", 4)) keepIt = 1;
+        else if (!strncmp(nm, "__ZN11TimeManager", 17)) keepIt = 1;
+        else if (!strncmp(nm, "__Z", 3) && strstr(nm, "Time_Get_Custom_Prop")) keepIt = 1;
+        else if (!strncmp(nm, "__Z", 3) && strstr(nm, "Time_Set_Custom_Prop")) keepIt = 1;
+        if (!keepIt) continue;
+        g_syms[g_symCount].name = strdup(nm);
+        g_syms[g_symCount].addr = (uintptr_t)(v + g_slide);   // n_value 是链接期地址，这里才需要 + slide
+        if (g_syms[g_symCount].name) g_symCount++;
+    }
+    mlog(@"sym: table built, %u symbols (slide=%#lx)", g_symCount, (unsigned long)g_slide);
+    if (!g_symCount) return;
+
     uint32_t cap = 1; while (cap < g_symCount * 2) cap <<= 1;
     g_hashBucket = (int32_t *)malloc(cap * sizeof(int32_t));
-    if (!g_hashBucket) return;
+    if (!g_hashBucket) { mlog(@"sym: hash malloc failed"); return; }
     for (uint32_t i = 0; i < cap; i++) g_hashBucket[i] = -1;
     g_hashMask = cap - 1;
     for (uint32_t i = 0; i < g_symCount; i++) {
