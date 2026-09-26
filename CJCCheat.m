@@ -750,7 +750,7 @@ static void mx_apply_speed(void) {
 }
 
 #pragma mark - ============ 前置声明 ============
-static void  mx_build_window(void);
+static void  mx_ensure_overlay(void);
 static void  mx_apply_speed(void);
 static void  mx_time_warmup(void);
 static void  mx_time_apply(float mul);
@@ -769,64 +769,55 @@ static void  mx_dump_found(void);
 
 // 面板开关状态（part6 的 LuaSvr hook 与 part7 的面板都要读）
 
-#pragma mark - ============ 悬浮 UI（独立 window + 穿透，Unity 系实证方案）============
+#pragma mark - ============ 悬浮 UI（v2：球直接挂游戏 window，无全屏容器）============
+// ⚠️ v1 用「独立 UIWindow(CGFLOAT_MAX) + 穿透 root」→ 真机「悬浮球外触摸无效果」。
+//    这与 GLQX v1.0/v1.1 踩的是同一个坑：部分游戏/设备上，自建 window 的
+//    事件路由不通（图层能显示，但触摸不落到游戏）。
+//    GLQX v1.2 实证解法：把球直接 addSubview 到【游戏 keyWindow】顶层。
+//    球只有 58pt，只对自身区域响应；其余区域根本没有我们的视图 → 事件直达游戏，
+//    结构上不可能挡住屏幕触摸。
 #define BALL_SIZE 58.0
 #define PANEL_W   250.0
-#define PANEL_H   168.0
+#define PANEL_H   232.0
 
-static UIWindow *g_win   = nil;
 static UIView   *g_ball  = nil;
 static UIView   *g_panel = nil;
 
-
-@interface CJPassthrough : UIView @end
-@implementation CJPassthrough
-- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    UIView *v = [super hitTest:p withEvent:e];
-    return (v == self) ? nil : v;   // 空白区放行 → 触摸穿透到游戏
+static UIWindow *mx_game_window(void) {
+    UIWindow *w = [UIApplication sharedApplication].delegate.window;
+    if (w) return w;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        for (UIWindow *ww in ws.windows) if (ww.isKeyWindow) return ww;
+        if (ws.windows.count) return ws.windows.firstObject;
+    }
+    return nil;
 }
-@end
 
-// 让 window 的 root view 真正是一个 CJPassthrough（否则穿透失效）
-@interface CJRootVC : UIViewController @end
-@implementation CJRootVC
-- (void)loadView {
-    self.view = [[CJPassthrough alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.view.backgroundColor = [UIColor clearColor];
-}
-@end
-
-static UIView *mx_ball_view(CGFloat size) {
-    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, size, size)];
-
-    // 抖音同款 conic 彩虹环
+static void mx_addRainbowRing(CALayer *parent, CGFloat inset) {
     CAGradientLayer *g = [CAGradientLayer layer];
     g.type = kCAGradientLayerConic;
     g.colors = @[(id)mx_c(0, 217, 217, 1).CGColor,
                  (id)mx_c(90, 90, 255, 1).CGColor,
                  (id)mx_c(255, 38, 38, 1).CGColor,
-                 (id)mx_c(255, 140, 0, 1).CGColor,
+                 (id)mx_c(255, 153, 0, 1).CGColor,
                  (id)mx_c(0, 217, 217, 1).CGColor];
-    g.locations = @[@0.0, @0.25, @0.5, @0.75, @1.0];
-    g.frame = v.bounds;
-
+    g.startPoint = CGPointMake(0.5, 0.5);
+    g.endPoint = CGPointMake(0.5, 0);
+    g.frame = CGRectMake(0, 0, parent.bounds.size.width, parent.bounds.size.height);
+    g.cornerRadius = g.frame.size.width / 2;
     CAShapeLayer *mask = [CAShapeLayer layer];
-    UIBezierPath *bp = [UIBezierPath bezierPathWithOvalInRect:v.bounds];
-    [bp appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectInset(v.bounds, size*0.08, size*0.08)]];
-    mask.path = bp.CGPath;
+    CGFloat r = g.frame.size.width / 2;
+    UIBezierPath *outer = [UIBezierPath bezierPathWithArcCenter:CGPointMake(r, r) radius:r
+                                                      startAngle:0 endAngle:M_PI*2 clockwise:YES];
+    UIBezierPath *inner = [UIBezierPath bezierPathWithArcCenter:CGPointMake(r, r) radius:r*inset
+                                                      startAngle:0 endAngle:M_PI*2 clockwise:YES];
+    [outer appendPath:inner];
+    mask.path = outer.CGPath;
     mask.fillRule = kCAFillRuleEvenOdd;
     g.mask = mask;
-    [v.layer addSublayer:g];
-
-    UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectInset(v.bounds, size*0.10, size*0.10)];
-    iv.image = mx_avatar();
-    iv.contentMode = UIViewContentModeScaleAspectFill;
-    iv.layer.cornerRadius = iv.bounds.size.width / 2.0;
-    iv.layer.masksToBounds = YES;
-    iv.userInteractionEnabled = NO;
-    [v addSubview:iv];
-    v.userInteractionEnabled = NO;   // 点击交给外层 g_ball
-    return v;
+    [parent addSublayer:g];
 }
 
 @interface CJBox : NSObject
@@ -843,21 +834,23 @@ static CJBox *g_box = nil;
 + (instancetype)shared { if (!g_box) g_box = [CJBox new]; return g_box; }
 
 - (void)ballTap {
-    if (!g_panel) { mlog(@"panel: nil"); return; }
-    g_panel.hidden = !g_panel.hidden;
-    if (!g_panel.hidden) {
-        // 面板贴着球弹出，自动避屏边
-        UIView *root = g_panel.superview;
-        CGRect b = root.bounds;
-        CGFloat x = g_ball.center.x - BALL_SIZE/2 - PANEL_W;
-        if (x < 6) x = g_ball.center.x + BALL_SIZE/2 + 6;
-        if (x + PANEL_W > b.size.width - 6) x = b.size.width - PANEL_W - 6;
-        CGFloat y = g_ball.center.y - PANEL_H/2;
-        y = MIN(MAX(y, 8), b.size.height - PANEL_H - 8);
-        g_panel.frame = CGRectMake(x, y, PANEL_W, PANEL_H);
-        [root bringSubviewToFront:g_panel];
+    if (g_panel) {                       // 点球 = 收起
+        [g_panel removeFromSuperview];
+        g_panel = nil;
+        mlog(@"panel closed");
+        return;
     }
-    mlog(@"panel toggled hidden=%d", g_panel.hidden);
+    UIWindow *w = g_ball.window;
+    if (!w) { mlog(@"ballTap: no window"); return; }
+    CGRect scr = w.bounds;
+    CGFloat px = g_ball.center.x - PANEL_W/2;
+    px = MAX(10, MIN(scr.size.width - PANEL_W - 10, px));
+    CGFloat py = g_ball.center.y + 70;
+    py = MAX(10, MIN(scr.size.height - PANEL_H - 10, py));
+    g_panel = [[CJPanel alloc] initWithFrame:CGRectMake(px, py, PANEL_W, PANEL_H)];
+    [w addSubview:g_panel];
+    [w bringSubviewToFront:g_panel];
+    mlog(@"panel opened at %.0f,%.0f", px, py);
 }
 
 - (void)ballDrag:(UIPanGestureRecognizer *)g {
@@ -865,8 +858,8 @@ static CJBox *g_box = nil;
     CGPoint t = [g translationInView:v.superview];
     CGPoint nc = CGPointMake(v.center.x + t.x, v.center.y + t.y);
     CGRect b = v.superview.bounds;
-    nc.x = MIN(MAX(nc.x, BALL_SIZE/2 + 4), b.size.width  - BALL_SIZE/2 - 4);
-    nc.y = MIN(MAX(nc.y, BALL_SIZE/2 + 4), b.size.height - BALL_SIZE/2 - 4);
+    nc.x = MIN(MAX(nc.x, BALL_SIZE/2), b.size.width  - BALL_SIZE/2);
+    nc.y = MIN(MAX(nc.y, BALL_SIZE/2), b.size.height - BALL_SIZE/2);
     v.center = nc;
     [g setTranslation:CGPointZero inView:v.superview];
 }
@@ -885,133 +878,149 @@ static CJBox *g_box = nil;
 - (void)keepTick {
     @autoreleasepool {
         @try {
-            if (!g_win || !g_win.rootViewController.view || g_ball.superview == nil) {
-                mlog(@"overlay lost, rebuild");
-                mx_build_window();
-            }
+            mx_ensure_overlay();
             mx_apply_speed();
         } @catch (NSException *e) { mlog(@"keepTick exc %@", e.name); }
     }
 }
 @end
 
-// --- 三个开关按钮 ---
-static UIButton *mx_btn(NSString *t, id target, SEL a, CGFloat y) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(12, y, PANEL_W - 24, 38);
-    b.backgroundColor = mx_c(255, 255, 255, 0.10);
-    b.layer.cornerRadius = 9;
-    b.layer.borderWidth = 1;
-    b.layer.borderColor = mx_c(255, 255, 255, 0.18).CGColor;
-    [b setTitle:t forState:UIControlStateNormal];
-    [b setTitleColor:mx_c(235, 235, 235, 1) forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [b addTarget:target action:a forControlEvents:UIControlEventTouchUpInside];
-    return b;
+static UIView *mx_build_ball(void) {
+    UIView *ball = [[UIView alloc] initWithFrame:CGRectMake(0, 0, BALL_SIZE, BALL_SIZE)];
+    ball.layer.cornerRadius = BALL_SIZE/2;
+    ball.layer.masksToBounds = NO;
+    ball.layer.shadowColor = [UIColor blackColor].CGColor;
+    ball.layer.shadowOpacity = 0.6;
+    ball.layer.shadowRadius = 6;
+    ball.layer.shadowOffset = CGSizeMake(0, 2);
+    mx_addRainbowRing(ball.layer, 0.88);
+    UIImageView *ava = [[UIImageView alloc] initWithFrame:CGRectMake(3, 3, BALL_SIZE-6, BALL_SIZE-6)];
+    ava.image = mx_avatar();
+    ava.contentMode = UIViewContentModeScaleAspectFill;
+    ava.layer.cornerRadius = (BALL_SIZE-6)/2;
+    ava.layer.masksToBounds = YES;
+    [ball addSubview:ava];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[CJBox shared] action:@selector(ballTap)];
+    [ball addGestureRecognizer:tap];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[CJBox shared] action:@selector(ballDrag:)];
+    [ball addGestureRecognizer:pan];
+    return ball;
 }
+
+// 把球挂到游戏 window 顶层；被游戏盖住/换窗时自愈
+static void mx_ensure_overlay(void) {
+    UIWindow *w = mx_game_window();
+    if (!w) { static int s_w = 0; if (++s_w <= 5) mlog(@"game window not ready #%d", s_w); return; }
+    BOOL need = NO;
+    if (!g_ball) { g_ball = mx_build_ball(); need = YES; }
+    else if (g_ball.superview != w) need = YES;
+    else if (w.subviews.lastObject != g_ball) {
+        [w bringSubviewToFront:g_ball];
+        static int s_b = 0; if (++s_b <= 5) mlog(@"ball brought to front #%d", s_b);
+    }
+    if (need) {
+        if (g_ball.frame.size.width < 1) g_ball.frame = CGRectMake(0, 0, BALL_SIZE, BALL_SIZE);
+        CGPoint old = g_ball.center;
+        CGRect scr = w.bounds;
+        if (old.x < 1 && old.y < 1)
+            g_ball.center = CGPointMake(scr.size.width - BALL_SIZE/2 - 18, scr.size.height * 0.42);
+        [w addSubview:g_ball];
+        [w bringSubviewToFront:g_ball];
+        mlog(@"ball attached to game window (%.0fx%.0f) subviews=%lu",
+             scr.size.width, scr.size.height, (unsigned long)w.subviews.count);
+    }
+    if (g_panel && g_panel.superview == w && w.subviews.lastObject != g_panel)
+        [w bringSubviewToFront:g_panel];
+}
+
+// --- 面板：深色卡 + 头像 + 标题 + 3 开关（可拖动、✕ 关闭）---
+static UILabel *g_btnKill = nil, *g_btnInv = nil, *g_btnSpd = nil;
+static const int kSpdVal[4] = { 1, 2, 4, 8 };
 
 @interface CJPanel : UIView
-- (void)toggleInv;
-- (void)toggleOne;
-- (void)toggleSpd;
 - (void)refresh;
-- (void)close;
 @end
 @implementation CJPanel
-- (void)toggleInv  { g_inv = !g_inv;      [self refresh]; mlog(@"flag invincible=%d", g_inv); }
-- (void)toggleOne  { g_oneshot = !g_oneshot; [self refresh]; mlog(@"flag oneshot=%d", g_oneshot); }
-- (void)toggleSpd  { g_speedIdx = (g_speedIdx + 1) % 4; [self refresh];
-                     mlog(@"flag speedIdx=%d", g_speedIdx); }
+- (instancetype)initWithFrame:(CGRect)f {
+    if ((self = [super initWithFrame:f])) {
+        self.backgroundColor = mx_c(20, 20, 31, 0.96);
+        self.layer.cornerRadius = 18;
+        self.layer.borderWidth = 1;
+        self.layer.borderColor = mx_c(255, 255, 255, 0.15).CGColor;
+        self.layer.shadowColor = [UIColor blackColor].CGColor;
+        self.layer.shadowOpacity = 0.5;
+        self.layer.shadowRadius = 12;
+        self.userInteractionEnabled = YES;
+
+        UIView *ballHost = mx_build_ball();
+        ballHost.frame = CGRectMake(14, 14, 40, 40);
+        ballHost.userInteractionEnabled = NO;   // 面板里的头像不接手势
+        [self addSubview:ballHost];
+
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(62, 14, 160, 22)];
+        title.text = @"✦ 昆哥儿科技 ✦";
+        title.textColor = mx_c(255, 191, 51, 1);
+        title.font = [UIFont boldSystemFontOfSize:15];
+        [self addSubview:title];
+
+        UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(62, 35, 160, 16)];
+        sub.text = @"创界传说 · 战斗助手";
+        sub.textColor = mx_c(255, 255, 255, 0.45);
+        sub.font = [UIFont systemFontOfSize:10];
+        [self addSubview:sub];
+
+        UIButton *x = [UIButton buttonWithType:UIButtonTypeCustom];
+        x.frame = CGRectMake(f.size.width - 42, 12, 30, 30);
+        [x setTitle:@"✕" forState:UIControlStateNormal];
+        x.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+        [x setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
+        [x addTarget:self action:@selector(closeTap) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:x];
+
+        CGFloat y = 66;
+        for (int i = 0; i < 3; i++) {
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+            b.frame = CGRectMake(16, y, f.size.width - 32, 42);
+            b.backgroundColor = mx_c(255, 255, 255, 0.07);
+            b.layer.cornerRadius = 10;
+            b.tag = i;
+            [b addTarget:self action:@selector(btnTap:) forControlEvents:UIControlEventTouchUpInside];
+            [self addSubview:b];
+            UILabel *lb = [[UILabel alloc] initWithFrame:b.bounds];
+            lb.textAlignment = NSTextAlignmentCenter;
+            lb.font = [UIFont boldSystemFontOfSize:14];
+            lb.userInteractionEnabled = NO;
+            [b addSubview:lb];
+            if (i == 0) g_btnKill = lb;
+            if (i == 1) g_btnInv  = lb;
+            if (i == 2) g_btnSpd  = lb;
+            y += 50;
+        }
+        [self refresh];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[CJBox shared] action:@selector(panelDrag:)];
+        [self addGestureRecognizer:pan];
+    }
+    return self;
+}
 - (void)refresh {
-    static const char *sp[4] = { "OFF", "x2", "x4", "x8" };
-    UIButton *b1 = (UIButton *)[self viewWithTag:101];
-    UIButton *b2 = (UIButton *)[self viewWithTag:102];
-    UIButton *b3 = (UIButton *)[self viewWithTag:103];
-    [b1 setTitle:[NSString stringWithFormat:@"无敌  %@", g_inv ? @"ON" : @"OFF"] forState:UIControlStateNormal];
-    [b2 setTitle:[NSString stringWithFormat:@"秒杀  %@", g_oneshot ? @"ON" : @"OFF"] forState:UIControlStateNormal];
-    [b3 setTitle:[NSString stringWithFormat:@"加速  %s", sp[g_speedIdx]] forState:UIControlStateNormal];
-    b1.backgroundColor = g_inv     ? mx_c(0, 190, 120, 0.45) : mx_c(255,255,255,0.10);
-    b2.backgroundColor = g_oneshot ? mx_c(0, 190, 120, 0.45) : mx_c(255,255,255,0.10);
-    b3.backgroundColor = g_speedIdx ? mx_c(0, 140, 255, 0.45) : mx_c(255,255,255,0.10);
+    g_btnKill.text = g_oneshot ? @"💀 秒杀  ON" : @"💀 秒杀  OFF";
+    g_btnKill.textColor = g_oneshot ? mx_c(77, 255, 102, 1) : [UIColor lightGrayColor];
+    g_btnInv.text  = g_inv ? @"🛡 无敌  ON" : @"🛡 无敌  OFF";
+    g_btnInv.textColor = g_inv ? mx_c(77, 255, 102, 1) : [UIColor lightGrayColor];
+    g_btnSpd.text  = g_speedIdx == 0 ? @"⏩ 加速  OFF"
+                                     : [NSString stringWithFormat:@"⏩ 加速  x%d", kSpdVal[g_speedIdx]];
+    g_btnSpd.textColor = g_speedIdx ? mx_c(255, 204, 51, 1) : [UIColor lightGrayColor];
 }
-- (void)close { self.hidden = YES; }
+- (void)closeTap { [g_panel removeFromSuperview]; g_panel = nil; mlog(@"panel closed"); }
+- (void)btnTap:(UIButton *)b {
+    if (b.tag == 0)      { g_oneshot = !g_oneshot; mlog(@"flag oneshot=%d", g_oneshot); }
+    else if (b.tag == 1) { g_inv = !g_inv;         mlog(@"flag invincible=%d", g_inv); }
+    else                 { g_speedIdx = (g_speedIdx + 1) % 4; mlog(@"flag speedIdx=%d", g_speedIdx); }
+    [self refresh];
+    mx_apply_speed();
+}
 @end
-
-static void mx_build_panel(void) {
-    CJPanel *p = [[CJPanel alloc] initWithFrame:CGRectMake(20, 120, PANEL_W, PANEL_H)];
-    p.backgroundColor = mx_c(22, 24, 30, 0.94);
-    p.layer.cornerRadius = 14;
-    p.layer.borderWidth = 1;
-    p.layer.borderColor = mx_c(255, 255, 255, 0.13).CGColor;
-    p.layer.shadowColor = [UIColor blackColor].CGColor;
-    p.layer.shadowOpacity = 0.5; p.layer.shadowRadius = 8; p.layer.shadowOffset = CGSizeMake(0,3);
-
-    UIView *head = mx_ball_view(36);
-    head.frame = CGRectMake(12, 10, 36, 36);
-    [p addSubview:head];
-
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(56, 12, PANEL_W - 90, 22)];
-    t.text = @"✦ 昆哥儿科技 ✦";
-    t.textColor = mx_c(255, 205, 90, 1);
-    t.font = [UIFont boldSystemFontOfSize:16];
-    [p addSubview:t];
-    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(56, 32, PANEL_W - 90, 16)];
-    sub.text = @"创界传说 · 悬浮助手";
-    sub.textColor = mx_c(160, 165, 175, 1);
-    sub.font = [UIFont systemFontOfSize:10];
-    [p addSubview:sub];
-
-    UIButton *x = [UIButton buttonWithType:UIButtonTypeCustom];
-    x.frame = CGRectMake(PANEL_W - 34, 8, 26, 26);
-    x.layer.cornerRadius = 13;
-    x.backgroundColor = mx_c(255, 255, 255, 0.10);
-    [x setTitle:@"✕" forState:UIControlStateNormal];
-    [x addTarget:p action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
-    [p addSubview:x];
-
-    UIButton *b1 = mx_btn(@"无敌  OFF", p, @selector(toggleInv), 54);  b1.tag = 101; [p addSubview:b1];
-    UIButton *b2 = mx_btn(@"秒杀  OFF", p, @selector(toggleOne), 98);  b2.tag = 102; [p addSubview:b2];
-    UIButton *b3 = mx_btn(@"加速  OFF", p, @selector(toggleSpd), 138); b3.tag = 103; [p addSubview:b3];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[CJBox shared] action:@selector(panelDrag:)];
-    [p addGestureRecognizer:pan];
-    [p refresh];
-    g_panel = p;
-}
-
-static void mx_build_window(void) {
-    if (g_win && g_win.rootViewController.view && g_ball.superview) { return; }
-    if (g_win) { g_win.hidden = YES; g_win = nil; g_ball = nil; g_panel = nil; }
-
-    g_win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    g_win.windowLevel = CGFLOAT_MAX;
-    g_win.rootViewController = [CJRootVC new];
-    g_win.backgroundColor = [UIColor clearColor];
-    g_win.hidden = NO;
-
-    CJPassthrough *root = (CJPassthrough *)g_win.rootViewController.view;
-
-    g_ball = [[UIView alloc] initWithFrame:CGRectMake(0, 0, BALL_SIZE, BALL_SIZE)];
-    g_ball.center = CGPointMake(root.bounds.size.width - BALL_SIZE/2 - 18, 150);
-    UIView *bv = mx_ball_view(BALL_SIZE);
-    bv.frame = g_ball.bounds;
-    [g_ball addSubview:bv];
-    g_ball.layer.shadowColor = [UIColor blackColor].CGColor;
-    g_ball.layer.shadowOpacity = 0.4; g_ball.layer.shadowRadius = 4;
-    g_ball.layer.shadowOffset = CGSizeMake(0, 2);
-    [root addSubview:g_ball];
-
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[CJBox shared] action:@selector(ballTap)];
-    [g_ball addGestureRecognizer:tap];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[CJBox shared] action:@selector(ballDrag:)];
-    [g_ball addGestureRecognizer:pan];
-
-    mx_build_panel();
-    g_panel.hidden = YES;
-    [root addSubview:g_panel];
-
-    mlog(@"overlay built (%.0fx%.0f)", root.bounds.size.width, root.bounds.size.height);
-}
 
 #pragma mark - ============ ctor：延迟初始化链（等 Unity 起来）============
 static int g_ctorStage = 0;
@@ -1079,7 +1088,7 @@ static void mx_dump_found(void) {
 }
 
 #pragma mark - UI tick（1s）
-static void mx_ui_tick(void) { @autoreleasepool { @try { mx_build_window(); } @catch (NSException *e) {} } }
+static void mx_ui_tick(void) { @autoreleasepool { @try { mx_ensure_overlay(); mx_apply_speed(); } @catch (NSException *e) {} } }
 
 static void cjcs_boot(void);
 
@@ -1105,7 +1114,7 @@ static void cjcs_boot(void) {
                     mx_stage();
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                         mx_stage();
-                        mx_build_window();
+                        mx_ensure_overlay();
                         [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t){ mx_ui_tick(); }];
                         [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t){
                             [[CJBox shared] keepTick];
