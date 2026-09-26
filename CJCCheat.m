@@ -300,6 +300,27 @@ typedef struct {
 
 static mx_il2cpp_t I;
 
+// ⚠️ 关键：il2cpp_domain_get_assemblies 返回的是 Il2CppAssembly**（不是 Il2CppImage**）。
+//    Il2CppAssembly 结构第一个字段才是 image，必须用 il2cpp_assembly_get_image 取。
+//    旧版把 Assembly* 直接当 Image 传给 class_from_name → 解引用垃圾 → SIGSEGV。
+static Il2CppImage mx_asm_image(void *asmObj) {
+    if (!asmObj || !I.assembly_get_image) return NULL;
+    return (Il2CppImage)I.assembly_get_image(asmObj);
+}
+
+static size_t mx_all_images(Il2CppImage **outImg, size_t cap) {
+    if (!I.domain_get || !I.domain_get_assemblies || !I.assembly_get_image) return 0;
+    size_t n = 0;
+    void **asms = (void **)I.domain_get_assemblies(I.domain_get(), &n);
+    if (!asms) return 0;
+    size_t k = 0;
+    for (size_t i = 0; i < n && k < cap; i++) {
+        Il2CppImage im = mx_asm_image(asms[i]);
+        if (im) outImg[k++] = im;
+    }
+    return k;
+}
+
 static int mx_il2cpp_load(void) {
     static int ok = -1;
     if (ok >= 0) return ok;
@@ -371,27 +392,6 @@ static Il2CppImage mx_image_by_name(const char *want) {
     return NULL;
 }
 
-
-// ⚠️ 关键：il2cpp_domain_get_assemblies 返回的是 Il2CppAssembly**（不是 Il2CppImage**）。
-//    Il2CppAssembly 结构第一个字段才是 image，必须用 il2cpp_assembly_get_image 取。
-//    旧版把 Assembly* 直接当 Image 传给 class_from_name → 解引用垃圾 → SIGSEGV。
-static Il2CppImage mx_asm_image(void *asmObj) {
-    if (!asmObj || !I.assembly_get_image) return NULL;
-    return (Il2CppImage)I.assembly_get_image(asmObj);
-}
-
-static size_t mx_all_images(Il2CppImage **outImg, size_t cap) {
-    if (!I.domain_get || !I.domain_get_assemblies || !I.assembly_get_image) return 0;
-    size_t n = 0;
-    void **asms = (void **)I.domain_get_assemblies(I.domain_get(), &n);
-    if (!asms) return 0;
-    size_t k = 0;
-    for (size_t i = 0; i < n && k < cap; i++) {
-        Il2CppImage im = mx_asm_image(asms[i]);
-        if (im) outImg[k++] = im;
-    }
-    return k;
-}
 
 // Obfuz 下 image 遍历顺序不定 → 全 image 扫
 static Il2CppClass *mx_class(const char *ns, const char *name) {
@@ -829,6 +829,8 @@ static void *mx_sym_find(const char *name);
 static int   mx_il2cpp_load(void);
 static int   mx_lua_load(void);
 static Il2CppClass *mx_class(const char *ns, const char *name);
+static size_t mx_all_images(Il2CppImage **outImg, size_t cap);
+static Il2CppImage mx_asm_image(void *asmObj);
 static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
 static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
 static int   mx_layout_probe(Il2CppMethodInfo *mi);
