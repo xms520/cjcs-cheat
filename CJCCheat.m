@@ -1167,7 +1167,6 @@ static void  mx_dump_found(void);
 static int   mx_ptr_plausible(uintptr_t p);
 static int   mx_ptr_executable(uintptr_t p);
 static const struct mach_header_64 *mx_unity_header(void);
-static void  mx_dump_found(void);
 
 // 面板开关状态（part6 的 LuaSvr hook 与 part7 的面板都要读）
 
