@@ -828,81 +828,7 @@ static void mx_time_apply(float mul) {
 //   3) 包一层：秒杀 → 对「我方造成伤害」的返回值放大；无敌 → 对「我方受到伤害」压 0
 //   4) 把所有发现写入 __CJCS_FOUND，native 落盘 → 供下一版精确化
 // 同时 native 每 tick 通过 __CJCS 全局表下发开关（无需文件 IO）
-static const char *kLuaHook =
-"-- CJCS Lua 自发现 hook（沙箱环境：全局读写落在我们自己的表上）\n"
-"-- 注意：chunk 的 _ENV 是 native 侧自建的沙箱表 S（S.__index=_G），\n"
-"--      所以这里所有全局赋值/读取都作用在 S 上，不受游戏 __newindex 加固影响。\n"
-"__CJCS_INSTALLED = true\n"
-"__CJCS_FOUND = {}\n"
-"__CJCS = { invincible = false, oneshot = false }\n"
-"local C = __CJCS\n"
-"local FOUND = __CJCS_FOUND\n"
-"\n"
-"local KW_HURT = { 'hurt', 'Hurt', 'damage', 'Damage', 'subhp', 'SubHp', 'reducehp' }\n"
-"local KW_ATK  = { 'attack', 'Attack' }\n"
-"local WRAPPED = {}\n"
-"\n"
-"local function hit(name, list)\n"
-"  for i = 1, #list do\n"
-"    if string.find(name, list[i], 1, true) then return true end\n"
-"  end\n"
-"  return false\n"
-"end\n"
-"\n"
-"local wrapped = 0\n"
-"local function wrap(tbl, key, path, kind)\n"
-"  local ok, f = pcall(function() return tbl[key] end)\n"
-"  if not ok or type(f) ~= 'function' then return end\n"
-"  if WRAPPED[f] then return end\n"
-"  WRAPPED[f] = true\n"
-"  local orig = f\n"
-"  tbl[key] = function(...)\n"
-"    local r = orig(...)\n"
-"    if kind == 'ATK' then\n"
-"      if C.oneshot and type(r) == 'number' and r > 0 then return r * 100000 end\n"
-"    else\n"
-"      if C.invincible and type(r) == 'number' and r > 0 then return 0 end\n"
-"    end\n"
-"    return r\n"
-"  end\n"
-"  wrapped = wrapped + 1\n"
-"  FOUND[#FOUND + 1] = path .. '|' .. key .. '|' .. kind\n"
-"end\n"
-"\n"
-"local seen = {}\n"
-"local function scan(tbl, path, depth)\n"
-"  if depth > 3 or type(tbl) ~= 'table' or seen[tbl] then return end\n"
-"  seen[tbl] = true\n"
-"  local n = 0\n"
-"  for k, v in pairs(tbl) do\n"
-"    n = n + 1\n"
-"    if n > 500 then break end\n"
-"    if type(k) == 'string' then\n"
-"      if type(v) == 'function' then\n"
-"        local kind = nil\n"
-"        if hit(k, KW_HURT) then kind = 'HURT'\n"
-"        elseif hit(k, KW_ATK) then kind = 'ATK' end\n"
-"        if kind then wrap(tbl, k, path, kind) end\n"
-"      elseif type(v) == 'table' then\n"
-"        scan(v, path .. '.' .. k, depth + 1)\n"
-"      end\n"
-"    end\n"
-"  end\n"
-"end\n"
-"\n"
-"-- 遍历已加载模块\n"
-"local keys = {}\n"
-"for k in pairs(package.loaded) do keys[#keys + 1] = k end\n"
-"table.sort(keys)\n"
-"for i = 1, #keys do\n"
-"  local k = keys[i]\n"
-"  if not string.find(k, '^_') then\n"
-"    local ok, m = pcall(require, k)\n"
-"    if ok and type(m) == 'table' then scan(m, k, 1) end\n"
-"  end\n"
-"end\n"
-"FOUND[#FOUND + 1] = 'modules=' .. #keys .. '|wrapped=' .. wrapped\n"
-"\n";
+static const char *kLuaHook = "-- (unused: pure-C path since v6)\n";
 
 #pragma mark - ============ 纯反射获取 lua_State（不 hook，最可靠）============
 // ⚠️ 实测教训：改 SLua.LuaSvr.Update 的 methodPointer 对外部调用【完全无效】——
@@ -1022,139 +948,147 @@ static size_t g_off_l       = (size_t)-1;    // SLua.LuaState.l_
 //      ↑ 说明沙箱思路对了，但【栈上 chunk 的位置取错】——pcallk 把表当函数调了
 //   v4（本版）：把所有下标都基于【函数内 gettop 实测的 base】重新计算，
 //              并在 pcallk 之前用 lua_type 断言栈顶确实是函数（不是表）。
-static void mx_inject_lua(lua_State *Ls) {
-    if (!Ls || !mx_lua_load()) return;
-    if (!L.getglobal || !L.setupvalue || !L.type) { mlog(@"lua: missing core API"); return; }
+// ⭐ 版本演进（全部来自真机日志，逐层逼近）：
+//   v1 loadbufferx+pcallk            → "variable '__CJCS_INSTALLED' is not declared"
+//   v2 _ENV = _G                     → 同上（_G 有 __newindex 加固）
+//   v3 自建沙箱表当 _ENV              → "attempt to call a table value"（栈下标错，已修）
+//   v4 栈已全对（base/top/type 均正确）→ "attempt to call a nil/string value"
+//   v5 registry 显式复制标准库 28/28   → 仍 "attempt to call a string value"
+//
+//   ⇒ 结论：游戏把 `string` / `table` / `package` 这些【全局名】整体换成了
+//     代理值（`string` 甚至是个字符串，不是标准库表），任何经 _ENV 的访问都不可信。
+//     **不再执行任何 Lua 字节码**。改为纯 C 直接操作 Lua 内部结构：
+//        registry[LUA_RIDX_GLOBALS] → package.loaded → 逐模块遍历
+//        rawget / lua_next 都是【完全绕开元方法】的原语，代理拦不住。
+//     本版目标：把真实的模块/函数结构落盘，为下一版精确挂点提供依据。
+#define LUA_REGISTRYINDEX_C (-1001000)
+#define LUA_RIDX_GLOBALS_C  2
+#define LUA_TNIL_C 0
+#define LUA_TBOOLEAN_C 1
+#define LUA_TTABLE_C 5
+#define LUA_TFUNCTION_C 6
 
-    // 绝对基准：进入时的栈顶
-    int base = L.gettop(Ls);
-    mlog(@"lua: inject begin, base=%d", base);
+static FILE *g_dump = NULL;
+static int   g_modCount = 0, g_fnCount = 0, g_candCount = 0;
+static const char *kCand[] = {
+    "hurt","Hurt","damage","Damage","hp","Hp","HP","attack","Attack",
+    "dead","Dead","die","Die","alive","attr","Attr","hpMax","maxHp","curHp",
+    "hurtValue","subHp","reduceHp","calcDamage","calDamage","onHurt","OnHurt"
+};
 
-    // [1] 沙箱表 S  ->  base+1
-    L.createtable(Ls, 0, 2);
-    int sIdx = base + 1;
-
-    // [2] 组装自足沙箱 —— ⚠️ 不能依赖 _G 的 __index！
-    //     实测：栈操作全对、chunk type=6，但 pcallk 报
-    //       "attempt to call a nil value" / "attempt to call a string value"
-    //     → 游戏的 _G 被加固，经元方法读到的是【代理值】而不是真函数。
-    //     解法：从 registry 的真实全局表 (LUA_RIDX_GLOBALS=2) 用 rawget 绕过元方法，
-    //           把标准库【显式复制】进沙箱。
-    #define LUA_REGISTRYINDEX_C (-1001000)
-    #define LUA_RIDX_GLOBALS_C 2
-    if (L.rawgeti && L.rawget && L.pushstring) {
-        L.rawgeti(Ls, LUA_REGISTRYINDEX_C, LUA_RIDX_GLOBALS_C);   // 真实全局表
-        int gtIdx = L.gettop(Ls);
-        if (L.type(Ls, gtIdx) == 5) {
-            static const char *need[] = {
-                "pcall","xpcall","type","tostring","tonumber","pairs","ipairs","next",
-                "select","error","assert","rawget","rawset","rawequal","rawlen",
-                "setmetatable","getmetatable","require","load","string","table","math",
-                "os","io","debug","package","utf8","collectgarbage"
-            };
-            int copied = 0;
-            for (size_t i = 0; i < sizeof(need)/sizeof(need[0]); i++) {
-                // 先试 rawget（绕过 __index 加固）
-                L.pushstring(Ls, need[i]);
-                L.rawget(Ls, gtIdx);                  // -> [S][GT][v]
-                if (L.type(Ls, -1) == 0 && L.getfield) {
-                    L.settop(Ls, -1);
-                    L.pushstring(Ls, need[i]);
-                    L.getfield(Ls, gtIdx, need[i]);    // 回落：走元方法
-                }
-                if (L.type(Ls, -1) != 0) {
-                    L.pushstring(Ls, need[i]);         // -> [S][GT][v][name]
-                    L.pushvalue(Ls, -2);               // 复制 v -> [S][GT][v][name][v]
-                    L.rawset(Ls, sIdx);                // S[name]=v -> [S][GT][v]
-                    copied++;
-                }
-                L.settop(Ls, -1);                      // -> [S][GT]
-            }
-            mlog(@"lua: sandbox stdlib copied %d/%zu from registry globals",
-                 copied, sizeof(need)/sizeof(need[0]));
-        } else {
-            mlog(@"lua: registry[2] type=%d (not table)", L.type(Ls, gtIdx));
-        }
-        L.settop(Ls, -1);                            // 弹掉真实全局表
-    } else {
-        mlog(@"lua: cannot access registry globals (rawgeti/rawget missing)");
-    }
-    mlog(@"lua: stack after sandbox: top=%d (expect %d)", L.gettop(Ls), sIdx);
-
-    // [3] 加载 chunk ->  base+2
-    int rc = L.L_loadbufferx(Ls, kLuaHook, strlen(kLuaHook), "@cjcs_hook", "t");
-    int top = L.gettop(Ls);
-    mlog(@"lua: loadbufferx rc=%d top=%d", rc, top);
-    if (rc != 0 || top < sIdx + 1) {
-        const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
-        mlog(@"lua: load FAILED (%s)", e ? e : "?");
-        L.settop(Ls, base);
-        return;
-    }
-    // ⚠️ 断言：栈顶必须是函数(6)，否则 pcallk 会报 "attempt to call a table value"
-    int chunkType = L.type(Ls, top);
-    mlog(@"lua: chunk type=%d (6=function, want 6)", chunkType);
-    if (chunkType != 6) {
-        mlog(@"lua: top slot is NOT a function -> abort");
-        L.settop(Ls, base);
-        return;
-    }
-
-    // [3.5] 先把沙箱表挂到 _G（用 rawset 绕过 __newindex）→ 便于执行后回读
-    if (L.rawset && L.pushstring && L.pushvalue) {
-        L.getglobal(Ls, "_G");
-        if (L.type(Ls, -1) == 5) {
-            L.pushstring(Ls, "__CJCS_SANDBOX");
-            L.pushvalue(Ls, sIdx);          // 复制 S（绝对下标）
-            L.rawset(Ls, -3);
-            mlog(@"lua: sandbox published to _G via rawset");
-        }
-        L.settop(Ls, -1);
-    }
-
-    // [4] chunk 的 _ENV(upvalue#1) = S
-    const char *up = L.setupvalue(Ls, top, 1);
-    mlog(@"lua: setupvalue -> %s", up ? up : "(null)");
-
-    // [5] 执行  func=chunk, nargs=0, nresults=-1
-    //     pcallk 的 funcidx 语义基于调用瞬间的栈：chunk 此时位于 top
-    int prc = L.pcallk(Ls, top, -1, 0, 0, NULL);
-    if (prc != 0) {
-        const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
-        mlog(@"lua: pcallk FAILED (rc=%d): %s", prc, e ? e : "?");
-        L.settop(Ls, base);
-        return;
-    }
-    L.settop(Ls, base);
-
-    // [6] 用 rawget 回读沙箱表（完全绕开元方法）
-    int okFlag = 0, foundType = -999;
-    // S 已被 settop 弹掉，改为从 _G 里取回我们 rawset 进去的沙箱
-    // 先看 _G["__CJCS_SANDBOX"]
-    L.getglobal(Ls, "__CJCS_SANDBOX");
-    if (L.type(Ls, -1) == 5) {
-        if (L.pushstring && L.rawget) {
-            L.pushstring(Ls, "__CJCS_INSTALLED");
-            L.rawget(Ls, -2);
-            okFlag = (L.type(Ls, -1) == 1) ? 1 : 0;
-            L.settop(Ls, -1);
-            L.pushstring(Ls, "__CJCS_FOUND");
-            L.rawget(Ls, -2);
-            foundType = L.type(Ls, -1);
-            L.settop(Ls, -1);
-        }
-    } else {
-        mlog(@"lua: __CJCS_SANDBOX not in _G (type=%d) -> rawset may have failed", L.type(Ls, -1));
-    }
-    L.settop(Ls, base);
-
-    if (!okFlag) {
-        mlog(@"lua: chunk executed but globals not visible (foundType=%d)", foundType);
-        return;
-    }
-    g_luaInjected = 1;
-    mlog(@"lua: SANDOX OK -> __CJCS_INSTALLED set, __CJCS_FOUND type=%d", foundType);
+static int mx_is_candidate(const char *fn) {
+    for (size_t i = 0; i < sizeof(kCand)/sizeof(kCand[0]); i++)
+        if (strstr(fn, kCand[i])) return 1;
+    return 0;
 }
+
+static void mx_lua_dump_tree(lua_State *Ls) {
+    if (!Ls || !mx_lua_load()) return;
+    if (!L.rawgeti || !L.rawget || !L.next || !L.pushnil || !L.pushstring || !L.type) {
+        mlog(@"lua dump: required API missing"); return;
+    }
+    const char *dp = [NSHomeDirectory() stringByAppendingPathComponent:
+                      @"Documents/cjcs_lua_dump.txt"].UTF8String;
+    if (!g_dump) g_dump = fopen(dp, "w");
+    if (!g_dump) { mlog(@"lua dump: cannot open file"); return; }
+    setvbuf(g_dump, NULL, _IOLBF, 0);
+
+    int base = L.gettop(Ls);
+    fprintf(g_dump, "# CJCS Lua structure dump\n");
+
+    // [1] registry[2] = 真实全局表（不走元方法）
+    L.rawgeti(Ls, LUA_REGISTRYINDEX_C, LUA_RIDX_GLOBALS_C);   // [G]
+    int gIdx = L.gettop(Ls);
+    if (L.type(Ls, gIdx) != LUA_TTABLE_C) {
+        mlog(@"lua dump: registry globals type=%d (not table)", L.type(Ls, gIdx));
+        fprintf(g_dump, "ABORT: registry globals type=%d\n", L.type(Ls, gIdx));
+        L.settop(Ls, base); return;
+    }
+    // 顺手报告 globals 里可疑名字的真实类型（解释 v4 的报错）
+    {
+        const char *probe[] = {"string","table","math","package","require","pcall","type","pairs","_G"};
+        for (size_t i = 0; i < sizeof(probe)/sizeof(probe[0]); i++) {
+            L.pushstring(Ls, probe[i]);
+            L.rawget(Ls, gIdx);
+            int t = L.type(Ls, -1);
+            fprintf(g_dump, "global %-8s rawget type=%d (5=table 6=function)\n", probe[i], t);
+            if (t == 2) {   // 字符串
+                size_t n = 0;
+                const char *v = L.tolstring ? L.tolstring(Ls, -1, &n) : NULL;
+                if (v) fprintf(g_dump, "    value = \"%.60s\"\n", v);
+            }
+            L.settop(Ls, -1);
+        }
+    }
+
+    // [2] G.package.loaded（模块表）
+    L.pushstring(Ls, "package");
+    L.rawget(Ls, gIdx);                       // [G][pkg]
+    int pIdx = L.gettop(Ls);
+    int lIdx = -1;
+    if (L.type(Ls, pIdx) == LUA_TTABLE_C) {
+        L.pushstring(Ls, "loaded");
+        L.rawget(Ls, pIdx);                   // [G][pkg][loaded]
+        lIdx = L.gettop(Ls);
+    } else {
+        // package 被代理 → 直接从 registry["_LOADED"] 拿（Lua 5.3+ 标准位置）
+        L.settop(Ls, -1);
+        L.pushstring(Ls, "_LOADED");
+        L.rawget(Ls, LUA_REGISTRYINDEX_C);
+        lIdx = L.gettop(Ls);
+        fprintf(g_dump, "package unavailable -> registry['_LOADED'] type=%d\n", L.type(Ls, lIdx));
+    }
+    if (lIdx < 0 || L.type(Ls, lIdx) != LUA_TTABLE_C) {
+        mlog(@"lua dump: no module table found");
+        L.settop(Ls, base); return;
+    }
+
+    // [3] 遍历模块
+    L.pushnil(Ls);
+    while (L.next(Ls, lIdx)) {                // [..][k][v]
+        size_t klen = 0;
+        const char *mod = L.tolstring ? L.tolstring(Ls, -2, &klen) : NULL;
+        int vt = L.type(Ls, -1);
+        if (mod && vt == LUA_TTABLE_C) {
+            g_modCount++;
+            fprintf(g_dump, "=== module %s\n", mod);
+            int vIdx = L.gettop(Ls);          // v 的绝对位置
+            L.pushnil(Ls);
+            int cnt = 0;
+            while (L.next(Ls, vIdx) && cnt < 400) {   // [..][v][k2][v2]
+                size_t flen = 0;
+                const char *fn = L.tolstring ? L.tolstring(Ls, -2, &flen) : NULL;
+                int t2 = L.type(Ls, -1);
+                if (fn) {
+                    if (t2 == LUA_TFUNCTION_C) {
+                        g_fnCount++;
+                        if (mx_is_candidate(fn)) {
+                            g_candCount++;
+                            fprintf(g_dump, "  [CAND] %s\n", fn);
+                        } else if (cnt < 60) {
+                            fprintf(g_dump, "  %s()\n", fn);
+                        }
+                    } else if (t2 == LUA_TTABLE_C && cnt < 60) {
+                        fprintf(g_dump, "  %s{}\n", fn);
+                    }
+                }
+                L.settop(Ls, -1);             // pop v2, 保留 k2 供 next
+                cnt++;
+            }
+            L.settop(Ls, -1);                 // pop k2
+        }
+        L.settop(Ls, -1);                     // pop v, 保留 k 供外层 next
+    }
+    L.settop(Ls, base);
+    fprintf(g_dump, "\n# summary: modules=%d functions=%d candidates=%d\n",
+            g_modCount, g_fnCount, g_candCount);
+    fflush(g_dump);
+    mlog(@"lua dump DONE: modules=%d functions=%d candidates=%d -> Documents/cjcs_lua_dump.txt",
+         g_modCount, g_fnCount, g_candCount);
+    g_luaInjected = 1;    // 标记已完成（不再重试）
+}
+
+static void mx_inject_lua(lua_State *Ls) { mx_lua_dump_tree(Ls); }
 
 static void mx_update_replacement(void *self, void *mi) {
     if (g_updateOrig) g_updateOrig(self, mi);
