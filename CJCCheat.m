@@ -1163,6 +1163,7 @@ static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
 static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
 static int   mx_layout_learn(Il2CppMethodInfo *mi, Il2CppClass *klass, const char *expectName);
 static void  mx_lua_tick_inject(void);
+static void  mx_dump_found(void);
 static int   mx_ptr_plausible(uintptr_t p);
 static int   mx_ptr_executable(uintptr_t p);
 static const struct mach_header_64 *mx_unity_header(void);
