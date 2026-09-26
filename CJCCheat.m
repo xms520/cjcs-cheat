@@ -820,6 +820,11 @@ static void mx_addRainbowRing(CALayer *parent, CGFloat inset) {
     [parent addSublayer:g];
 }
 
+// 前置声明：CJBox 的 ballTap 里要 alloc CJPanel（实现在后面）
+@interface CJPanel : UIView
+- (void)refresh;
+@end
+
 @interface CJBox : NSObject
 + (instancetype)shared;
 - (void)ballTap;
@@ -937,9 +942,6 @@ static void mx_ensure_overlay(void) {
 static UILabel *g_btnKill = nil, *g_btnInv = nil, *g_btnSpd = nil;
 static const int kSpdVal[4] = { 1, 2, 4, 8 };
 
-@interface CJPanel : UIView
-- (void)refresh;
-@end
 @implementation CJPanel
 - (instancetype)initWithFrame:(CGRect)f {
     if ((self = [super initWithFrame:f])) {
