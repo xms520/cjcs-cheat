@@ -652,6 +652,8 @@ static struct {
     void           (*pushlightuserdata)(lua_State *, void *);
     const char*    (*setupvalue)(lua_State *, int, int);
     void           (*rawget)(lua_State *, int);
+    void           (*pushnil)(lua_State *);
+    int            (*next)(lua_State *, int);
     void           (*rawset)(lua_State *, int);
     void           (*setmetatable_fn)(lua_State *, int);
     void           (*getmetatable_fn)(lua_State *, int);
@@ -683,6 +685,8 @@ static int mx_lua_load(void) {
         {"_lua_rawlen",       (void **)&L.rawlen},
         {"_lua_setupvalue",   (void **)&L.setupvalue},
         {"_lua_rawget",       (void **)&L.rawget},
+        {"_lua_pushnil",      (void **)&L.pushnil},
+        {"_lua_next",         (void **)&L.next},
         {"_lua_rawset",       (void **)&L.rawset},
         {"_lua_setmetatable", (void **)&L.setmetatable_fn},
         {"_lua_getmetatable", (void **)&L.getmetatable_fn},
