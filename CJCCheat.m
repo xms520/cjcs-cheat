@@ -650,6 +650,10 @@ static struct {
     unsigned long long (*rawlen)(lua_State *, int);
     void           (*pushlightuserdata)(lua_State *, void *);
     const char*    (*setupvalue)(lua_State *, int, int);
+    void           (*rawget)(lua_State *, int);
+    void           (*rawset)(lua_State *, int);
+    void           (*setmetatable_fn)(lua_State *, int);
+    void           (*getmetatable_fn)(lua_State *, int);
     int            (*pcallk_raw)(lua_State *, int, int, int, int, void *);
 } L;
 
@@ -676,6 +680,10 @@ static int mx_lua_load(void) {
         {"_lua_rawgeti",      (void **)&L.rawgeti},
         {"_lua_rawlen",       (void **)&L.rawlen},
         {"_lua_setupvalue",   (void **)&L.setupvalue},
+        {"_lua_rawget",       (void **)&L.rawget},
+        {"_lua_rawset",       (void **)&L.rawset},
+        {"_lua_setmetatable", (void **)&L.setmetatable_fn},
+        {"_lua_getmetatable", (void **)&L.getmetatable_fn},
     };
     int miss = 0;
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
@@ -819,23 +827,28 @@ static void mx_time_apply(float mul) {
 //   4) 把所有发现写入 __CJCS_FOUND，native 落盘 → 供下一版精确化
 // 同时 native 每 tick 通过 __CJCS 全局表下发开关（无需文件 IO）
 static const char *kLuaHook =
-"if __CJCS_INSTALLED then return end\n"
+"-- CJCS Lua 自发现 hook（沙箱环境：全局读写落在我们自己的表上）\n"
+"-- 注意：chunk 的 _ENV 是 native 侧自建的沙箱表 S（S.__index=_G），\n"
+"--      所以这里所有全局赋值/读取都作用在 S 上，不受游戏 __newindex 加固影响。\n"
 "__CJCS_INSTALLED = true\n"
-"local FOUND = {}\n"
-"__CJCS_FOUND = FOUND\n"
-"__CJCS = __CJCS or {}\n"
+"__CJCS_FOUND = {}\n"
+"__CJCS = { invincible = false, oneshot = false }\n"
 "local C = __CJCS\n"
-"C.invincible = C.invincible or false\n"
-"C.oneshot    = C.oneshot    or false\n"
-"local KW_DMG   = { 'damage','Damage','hurt','Hurt','hurtvalue','hurtValue','subhp','reducehp','attack','Attack' }\n"
-"local KW_STATE = { 'hp','Hp','HP','health','Health','attr','Attr','dead','Dead','die','Die','alive' }\n"
-"local function has(s, list)\n"
-"  for i=1,#list do if string.find(s, list[i], 1, true) then return list[i] end end\n"
-"  return nil\n"
+"local FOUND = __CJCS_FOUND\n"
+"\n"
+"local KW_HURT = { 'hurt', 'Hurt', 'damage', 'Damage', 'subhp', 'SubHp', 'reducehp' }\n"
+"local KW_ATK  = { 'attack', 'Attack' }\n"
+"local WRAPPED = {}\n"
+"\n"
+"local function hit(name, list)\n"
+"  for i = 1, #list do\n"
+"    if string.find(name, list[i], 1, true) then return true end\n"
+"  end\n"
+"  return false\n"
 "end\n"
-"local WRAPPED = setmetatable({}, { __mode = 'k' })\n"
+"\n"
 "local wrapped = 0\n"
-"local function wrapFn(tbl, key, path, kind)\n"
+"local function wrap(tbl, key, path, kind)\n"
 "  local ok, f = pcall(function() return tbl[key] end)\n"
 "  if not ok or type(f) ~= 'function' then return end\n"
 "  if WRAPPED[f] then return end\n"
@@ -843,52 +856,51 @@ static const char *kLuaHook =
 "  local orig = f\n"
 "  tbl[key] = function(...)\n"
 "    local r = orig(...)\n"
-"    if kind == 'DMG' then\n"
-"      if C.oneshot and type(r) == 'number' and r > 0 then return r * 100000\n"
-"      end\n"
-"    elseif kind == 'HURT' then\n"
+"    if kind == 'ATK' then\n"
+"      if C.oneshot and type(r) == 'number' and r > 0 then return r * 100000 end\n"
+"    else\n"
 "      if C.invincible and type(r) == 'number' and r > 0 then return 0 end\n"
 "    end\n"
 "    return r\n"
 "  end\n"
 "  wrapped = wrapped + 1\n"
-"  FOUND[#FOUND+1] = path .. '.' .. key .. ' [' .. kind .. ']'\n"
+"  FOUND[#FOUND + 1] = path .. '|' .. key .. '|' .. kind\n"
 "end\n"
+"\n"
 "local seen = {}\n"
 "local function scan(tbl, path, depth)\n"
 "  if depth > 3 or type(tbl) ~= 'table' or seen[tbl] then return end\n"
 "  seen[tbl] = true\n"
 "  local n = 0\n"
 "  for k, v in pairs(tbl) do\n"
-"    n = n + 1; if n > 400 then break end\n"
+"    n = n + 1\n"
+"    if n > 500 then break end\n"
 "    if type(k) == 'string' then\n"
 "      if type(v) == 'function' then\n"
-"        local kw = has(k, KW_DMG)\n"
-"        if kw then\n"
-"          if string.find(k, 'hurt', 1, true) or string.find(k, 'Hurt', 1, true)\n"
-"             or string.find(k, 'damage', 1, true) or string.find(k, 'Damage', 1, true) then\n"
-"            wrapFn(tbl, k, path, 'HURT')\n"
-"          elseif string.find(k, 'attack', 1, true) or string.find(k, 'Attack', 1, true) then\n"
-"            wrapFn(tbl, k, path, 'DMG')\n"
-"          end\n"
-"        end\n"
+"        local kind = nil\n"
+"        if hit(k, KW_HURT) then kind = 'HURT'\n"
+"        elseif hit(k, KW_ATK) then kind = 'ATK' end\n"
+"        if kind then wrap(tbl, k, path, kind) end\n"
 "      elseif type(v) == 'table' then\n"
 "        scan(v, path .. '.' .. k, depth + 1)\n"
 "      end\n"
 "    end\n"
 "  end\n"
 "end\n"
+"\n"
+"-- 遍历已加载模块\n"
 "local keys = {}\n"
-"for k in pairs(package.loaded) do keys[#keys+1] = k end\n"
+"for k in pairs(package.loaded) do keys[#keys + 1] = k end\n"
 "table.sort(keys)\n"
-"for i=1,#keys do\n"
+"for i = 1, #keys do\n"
 "  local k = keys[i]\n"
 "  if not string.find(k, '^_') then\n"
 "    local ok, m = pcall(require, k)\n"
 "    if ok and type(m) == 'table' then scan(m, k, 1) end\n"
 "  end\n"
 "end\n"
-"FOUND[#FOUND+1] = 'modules=' .. #keys .. ' wrapped=' .. wrapped\n";
+"FOUND[#FOUND + 1] = 'modules=' .. #keys .. '|wrapped=' .. wrapped\n"
+"\n";
 
 #pragma mark - ============ 纯反射获取 lua_State（不 hook，最可靠）============
 // ⚠️ 实测教训：改 SLua.LuaSvr.Update 的 methodPointer 对外部调用【完全无效】——
@@ -992,13 +1004,35 @@ static lua_State        *g_L          = NULL;
 static size_t g_off_luaState = (size_t)-1;   // SLua.LuaSvr.luaState
 static size_t g_off_l       = (size_t)-1;    // SLua.LuaState.l_
 
+// ⭐ 为什么需要沙箱表：
+//   日志实测 lua_setupvalue 成功（upvalue=_ENV 已返回名字），但 chunk 首行仍报
+//   "variable '__CJCS_INSTALLED' is not declared" —— 说明 _ENV 的写入被拦了。
+//   游戏的全局表带 __index/__newindex 元方法（SLua/加固层），直接写 _G.xxx 无效；
+//   而且该 Lua 5.3 被编译为"未声明全局=编译错"，所以 chunk 里连读都不允许。
+//   解法：自建一个沙箱表 S 作为 chunk 的 _ENV：
+//     S.__index = _G      （读落到游戏全局表 → 能访问 require/pairs/string 等）
+//     S 自身可写          （我们的写入不受 __newindex 影响）
+//   这样 chunk 内的一切全局操作都在我们自己的表上完成。
 static void mx_inject_lua(lua_State *Ls) {
     if (!Ls || !mx_lua_load()) return;
     if (!L.getglobal || !L.setupvalue) { mlog(@"lua: missing getglobal/setupvalue"); return; }
-
     int base = L.gettop(Ls);
 
-    // 加载 chunk（"t" = 文本模式）
+    // 1) 自建沙箱表 (0,2)
+    L.createtable(Ls, 0, 2);
+
+    // 2) S.__index = _G   — 让 chunk 能读到游戏全局（require / string / pairs ...）
+    if (L.getglobal && L.setfield) {
+        L.getglobal(Ls, "_G");
+        if (L.type(Ls, -1) == 5) {
+            L.setfield(Ls, -2, "__index");          // S.__index = _G
+        } else {
+            L.settop(Ls, -1);                       // 弹掉非表值
+            mlog(@"lua: _G is not a table (type=%d) -> sandbox has no __index", L.type(Ls, -1));
+        }
+    }
+
+    // 3) 加载 chunk → 栈: [S][chunk]
     if (L.L_loadbufferx(Ls, kLuaHook, strlen(kLuaHook), "@cjcs_hook", "t") != 0) {
         const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
         mlog(@"lua: loadbufferx FAILED: %s", e ? e : "?");
@@ -1006,39 +1040,45 @@ static void mx_inject_lua(lua_State *Ls) {
         return;
     }
 
-    // ⭐ Lua 5.3 关键：主 chunk 的 1 号 upvalue 是 _ENV，必须显式设为全局表，
-    //    否则 chunk 内所有全局读写都落在 nil 上 →
-    //    "variable '__CJCS_INSTALLED' is not declared"（实测就是这个错）
-    L.getglobal(Ls, "_G");
-    if (L.type(Ls, -1) == 5 /* TABLE */) {
-        const char *up = L.setupvalue(Ls, -2, 1);   // chunk 在 -2，_ENV 在 -1
-        mlog(@"lua: _ENV set -> upvalue=%s", up ? up : "(null!)");
-        L.settop(Ls, -1);                            // 弹掉 _G
-    } else {
-        mlog(@"lua: _G not a table (type=%d) -> abort", L.type(Ls, -1));
-        L.settop(Ls, base);
-        return;
-    }
+    // 4) chunk 的 _ENV(upvalue#1) = S   栈: [S][chunk(ENV=S)]
+    const char *up = L.setupvalue(Ls, -1, 1);
+    mlog(@"lua: sandbox _ENV set (upvalue=%s)", up ? up : "(null)");
 
+    // 5) 执行
     if (L.pcallk(Ls, 0, -1, 0, 0, NULL) != 0) {
         const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
         mlog(@"lua: pcallk FAILED: %s", e ? e : "?");
         L.settop(Ls, base);
         return;
     }
+    // 栈: [S]
+    // 6) 回读：用 rawget 直接查沙箱表（完全绕开元方法）
+    int okFlag = 0, foundType = -999;
+    if (L.rawget && L.pushstring) {
+        L.pushstring(Ls, "__CJCS_INSTALLED");
+        L.rawget(Ls, -2);                     // S["__CJCS_INSTALLED"]
+        okFlag = (L.type(Ls, -1) == 1) ? 1 : 0;
+        L.settop(Ls, -1);
+        L.pushstring(Ls, "__CJCS_FOUND");
+        L.rawget(Ls, -2);
+        foundType = L.type(Ls, -1);
+        L.settop(Ls, -1);
+    }
+    // 7) 把沙箱表存进游戏全局表（用 _G 的 rawset 绕过 __newindex）
+    if (L.getglobal && L.rawset) {
+        L.pushstring(Ls, "__CJCS_SANDBOX");
+        L.pushvalue(Ls, -2);                  // 复制 S
+        L.rawset(Ls, -3);                     // _G["__CJCS_SANDBOX"] = S
+        // 同时尝试常规 setglobal（可能被拦，失败也无所谓）
+    }
     L.settop(Ls, base);
 
-    // 回读自证：__CJCS_INSTALLED 真的设上了吗？
-    L.getglobal(Ls, "__CJCS_INSTALLED");
-    int okFlag = (L.type(Ls, -1) == 1 /* BOOLEAN */) ? 1 : 0;
-    L.settop(Ls, -1);
-    L.getglobal(Ls, "__CJCS_FOUND");
-    int foundType = L.type(Ls, -1);
-    L.settop(Ls, -1);
-
-    if (!okFlag) { mlog(@"lua: inject ran but __CJCS_INSTALLED missing -> chunk ineffective"); return; }
+    if (!okFlag) {
+        mlog(@"lua: chunk ran but __CJCS_INSTALLED still missing (sandbox=%d)", foundType);
+        return;
+    }
     g_luaInjected = 1;
-    mlog(@"lua: HOOK INJECTED into state %p (__CJCS_FOUND type=%d)", (void *)Ls, foundType);
+    mlog(@"lua: HOOK INJECTED, sandbox ok (__CJCS_FOUND type=%d)", foundType);
 }
 
 static void mx_update_replacement(void *self, void *mi) {
