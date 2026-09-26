@@ -470,11 +470,23 @@ typedef struct {
     int      klassOff;  // klass 偏移
 } mx_mi_layout_t;
 static int mx_ptr_plausible(uintptr_t p) {
-    if (p < 0x1000) return 0;
-    const struct mach_header_64 *mh = mx_unity_header();
-    if (!mh) return 0;
-    uintptr_t base = (uintptr_t)mh;
-    return (p >= base && p < base + kUnityTextSize);
+    if (p < 0x1000ULL) return 0;
+    // ⚠️ 实测：il2cpp 的 name 字符串等不一定落在 UnityFramework __TEXT 内
+    //    （可能在独立映射区），旧的「必须落在 Unity __TEXT」判定会误杀合法指针。
+    //    改为问内核：这个地址到底有没有被映射、是否可读。
+    mach_vm_address_t addr = (mach_vm_address_t)p;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_port_t obj = MACH_PORT_NULL;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &addr, &size,
+                                      VM_REGION_BASIC_INFO_64,
+                                      (vm_region_info_t)&info, &cnt, &obj);
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    if (kr != KERN_SUCCESS) return 0;
+    if (addr > p) return 0;                       // p 落在空洞里
+    if (!(info.protection & VM_PROT_READ)) return 0;
+    return 1;
 }
 
 static mx_mi_layout_t g_mi = { -1, -1, -1 };
@@ -482,9 +494,16 @@ static mx_mi_layout_t g_mi = { -1, -1, -1 };
 // 校验一个 MethodInfo 是否可信：布局已知 + name 字段指向的字符串等于期望名
 static int mx_mi_valid(Il2CppMethodInfo *mi, const char *expectName) {
     if (!mi || g_mi.nameOff < 0) return 0;
+    // mi 自身也必须是可读内存
+    if (!mx_ptr_plausible((uintptr_t)mi)) return 0;
     uintptr_t nm = *(uintptr_t *)((uint8_t *)mi + g_mi.nameOff);
     if (!nm || !mx_ptr_plausible(nm)) return 0;
-    if (expectName && strcmp((const char *)nm, expectName)) return 0;
+    if (expectName) {
+        // 名字串首字节必须是可打印 ASCII，且完整匹配
+        unsigned char c0 = *(unsigned char *)nm;
+        if (c0 < 0x20 || c0 > 0x7e) return 0;
+        if (strcmp((const char *)nm, expectName)) return 0;
+    }
     return 1;
 }
 
@@ -494,15 +513,11 @@ static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc) {
     if (I.class_get_method_from_name) {
         Il2CppMethodInfo *m = I.class_get_method_from_name(k, name, argc);
         if (m) {
-            uintptr_t a = (uintptr_t)m;
-            const struct mach_header_64 *mh = mx_unity_header();
-            uintptr_t base = (uintptr_t)mh;
-            // ⚠️ 实测该 API 会返回映像外的垃圾指针 → 必须校验归属
-            if (base && a >= base && a < base + kUnityTextSize + 0x720000) {
-                if (g_mi.nameOff < 0 || mx_mi_valid(m, name)) return m;
-            } else {
-                mlog(@"mx_meth(%s): API returned OUT-OF-IMAGE %p -> fallback to iterator", name, (void *)a);
-            }
+            // 校验：指针可读 + （布局已知时）name 字段确实等于我们要的方法名
+            if (mx_ptr_plausible((uintptr_t)m) &&
+                (g_mi.nameOff < 0 || mx_mi_valid(m, name)))
+                return m;
+            mlog(@"mx_meth(%s): API ptr %p rejected -> iterator fallback", name, (void *)m);
         }
     }
     // 2) 迭代器兜底（走 class 内部方法数组，地址可靠）
