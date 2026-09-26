@@ -474,14 +474,14 @@ static int mx_ptr_plausible(uintptr_t p) {
     // ⚠️ 实测：il2cpp 的 name 字符串等不一定落在 UnityFramework __TEXT 内
     //    （可能在独立映射区），旧的「必须落在 Unity __TEXT」判定会误杀合法指针。
     //    改为问内核：这个地址到底有没有被映射、是否可读。
-    mach_vm_address_t addr = (mach_vm_address_t)p;
-    mach_vm_size_t size = 0;
+    vm_address_t addr = (vm_address_t)p;
+    vm_size_t size = 0;
     vm_region_basic_info_data_64_t info;
     mach_port_t obj = MACH_PORT_NULL;
     mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &addr, &size,
-                                      VM_REGION_BASIC_INFO_64,
-                                      (vm_region_info_t)&info, &cnt, &obj);
+    kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size,
+                                    VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &cnt, &obj);
     if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
     if (kr != KERN_SUCCESS) return 0;
     if (addr > p) return 0;                       // p 落在空洞里
