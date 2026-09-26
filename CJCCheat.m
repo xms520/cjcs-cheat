@@ -335,6 +335,7 @@ typedef struct {
     void*             (*thread_attach)(Il2CppDomain);
     void*             (*thread_current)(void);
     void              (*gc_disable)(void);
+    void*             (*class_get_property_from_name)(Il2CppClass *, const char *);
     size_t            (*image_get_class_count)(Il2CppImage);
     Il2CppClass*      (*image_get_class)(Il2CppImage, size_t);
     const char*       (*image_get_name)(Il2CppImage);
@@ -403,6 +404,7 @@ static int mx_il2cpp_load(void) {
         {"_il2cpp_image_get_class",            (void **)&I.image_get_class},
         {"_il2cpp_class_get_static_field_data",(void **)&I.class_get_static_field_data},
         {"_il2cpp_runtime_class_init",         (void **)&I.class_init},
+        {"_il2cpp_class_get_property_from_name",(void **)&I.class_get_property_from_name},
     };
     int miss = 0, optional_miss = 0, outrange = 0;
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
@@ -463,17 +465,33 @@ static Il2CppClass *mx_class(const char *ns, const char *name) {
 }
 
 static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc) {
-    if (!k || !I.class_get_method_from_name) return NULL;
-    Il2CppMethodInfo *m = I.class_get_method_from_name(k, name, argc);
-    if (m) return m;
-    // 迭代器兜底（Obfuz 偶发名字命中失败）
-    if (I.class_get_methods && I.method_get_name && I.method_get_param_count) {
+    if (!k) return NULL;
+    // 1) 正式 API（最快）
+    if (I.class_get_method_from_name) {
+        Il2CppMethodInfo *m = I.class_get_method_from_name(k, name, argc);
+        if (m) {
+            uintptr_t a = (uintptr_t)m;
+            const struct mach_header_64 *mh = mx_unity_header();
+            uintptr_t base = (uintptr_t)mh;
+            // ⚠️ 实测该 API 会返回映像外的垃圾指针 → 必须校验归属
+            if (base && a >= base && a < base + kUnityTextSize + 0x720000) {
+                if (g_mi.nameOff < 0 || mx_mi_valid(m, name)) return m;
+            } else {
+                mlog(@"mx_meth(%s): API returned OUT-OF-IMAGE %p -> fallback to iterator", name, (void *)a);
+            }
+        }
+    }
+    // 2) 迭代器兜底（走 class 内部方法数组，地址可靠）
+    if (I.class_get_methods && I.method_get_name) {
         void *it = NULL;
         Il2CppMethodInfo *mm;
         int guard = 0;
-        while ((mm = I.class_get_methods(k, &it)) != NULL && guard++ < 4096) {
+        while ((mm = I.class_get_methods(k, &it)) != NULL && guard++ < 8192) {
             const char *mn = I.method_get_name(mm);
-            if (mn && !strcmp(mn, name) && I.method_get_param_count(mm) == argc) return mm;
+            if (!mn) continue;
+            if (strcmp(mn, name)) continue;
+            if (argc >= 0 && I.method_get_param_count && I.method_get_param_count(mm) != argc) continue;
+            return mm;
         }
     }
     return NULL;
@@ -513,34 +531,54 @@ static int mx_ptr_plausible(uintptr_t p) {
     return (p >= base && p < base + kUnityTextSize);
 }
 
-static int mx_layout_probe(Il2CppMethodInfo *mi) {
-    if (!mi) return 0;
+// ⭐ 自洽法：不猜偏移。用 il2cpp_method_get_name(mi) 拿到名字字符串的真实地址，
+//    再在 mi 的前 128 字节里找哪个 8 字节字段等于这个地址 → 那就是 nameOff。
+//    同理：哪个字段等于 klass 指针 → klassOff；哪个字段落在 __TEXT 代码段 → ptrOff。
+static int mx_layout_learn(Il2CppMethodInfo *mi, Il2CppClass *klass, const char *expectName) {
+    if (!mi || !I.method_get_name) return 0;
     uint8_t *b = (uint8_t *)mi;
-    // 候选：ptrOff ∈ {0, 8}, nameOff ∈ {8,16,24,32}, klassOff ∈ {16,24,32,40}
-    static const int po[] = {0, 8};
-    static const int no[] = {8, 16, 24, 32};
-    static const int ko[] = {16, 24, 32, 40};
-    for (int a = 0; a < 2; a++) {
-        for (int c = 0; c < 4; c++) {
-            uintptr_t np = *(uintptr_t *)(b + no[c]);
-            if (!mx_ptr_plausible(np)) continue;
-            if (strcmp((const char *)np, "Update")) continue;
-            for (int d = 0; d < 4; d++) {
-                uintptr_t kp = *(uintptr_t *)(b + ko[d]);
-                if (kp < 0x100000000ULL) continue;
-                // name 命中即确认
-                g_mi.ptrOff = po[a]; g_mi.nameOff = no[c]; g_mi.klassOff = ko[d];
-                mlog(@"mi layout: ptr=%d name=%d klass=%d (ptr=%p)",
-                     po[a], no[c], ko[d], (void *)*(uintptr_t *)(b + po[a]));
-                return 1;
-            }
-        }
+    uintptr_t nm = 0;
+
+    if (expectName) {
+        // 用 API 拿到的真实名字地址（最可靠）
+        // 注意：mi 可能是垃圾指针，先做基本校验
+        nm = (uintptr_t)I.method_get_name(mi);
     }
-    // 打原始字节，便于下一版精确修正
-    char hex[3 * 64 + 1]; hex[0] = 0;
-    for (int i = 0; i < 64; i++) snprintf(hex + i*3, 4, "%02x ", b[i]);
-    mlog(@"mi layout FAILED, raw64=%s", hex);
-    return 0;
+    if (!nm) {
+        // 退路：用迭代器拿第一个方法（迭代器走的是 class 内部数组，比哈希查找稳）
+        void *it = NULL;
+        Il2CppMethodInfo *first = I.class_get_methods ? I.class_get_methods(klass, &it) : NULL;
+        if (first && I.method_get_name) nm = (uintptr_t)I.method_get_name(first);
+    }
+    if (!nm) { mlog(@"mi learn: cannot obtain any method name"); return 0; }
+
+    int nameOff = -1, klassOff = -1, ptrOff = -1;
+    for (int off = 0; off <= 120; off += 8) {
+        uintptr_t v = *(uintptr_t *)(b + off);
+        if (v == nm && nameOff < 0) nameOff = off;
+        if (klass && v == (uintptr_t)klass && klassOff < 0) klassOff = off;
+        if (ptrOff < 0 && v && mx_ptr_plausible(v)) ptrOff = off;
+    }
+    if (nameOff < 0) {
+        char hex[3*96+1]; hex[0]=0;
+        for (int i = 0; i < 96; i++) snprintf(hex + i*3, 4, "%02x ", b[i]);
+        mlog(@"mi learn FAILED (nm=%p klass=%p) raw96=%s", (void *)nm, klass, hex);
+        return 0;
+    }
+    g_mi.nameOff  = nameOff;
+    g_mi.klassOff = klassOff;
+    g_mi.ptrOff   = (ptrOff >= 0) ? ptrOff : 0;
+    mlog(@"mi layout LEARNED: ptr=%d name=%d klass=%d", g_mi.ptrOff, g_mi.nameOff, g_mi.klassOff);
+    return 1;
+}
+
+// 校验一个 MethodInfo 是否可信：布局已知 + name 字段指向的字符串等于期望名
+static int mx_mi_valid(Il2CppMethodInfo *mi, const char *expectName) {
+    if (!mi || g_mi.nameOff < 0) return 0;
+    uintptr_t nm = *(uintptr_t *)((uint8_t *)mi + g_mi.nameOff);
+    if (!nm || !mx_ptr_plausible(nm)) return 0;
+    if (expectName && strcmp((const char *)nm, expectName)) return 0;
+    return 1;
 }
 
 #pragma mark - ============ Lua C API（内存符号表，未导出但可定位）============
@@ -609,57 +647,90 @@ static int mx_lua_load(void) {
 //   UnityEngine.Time.set_timeScale(float)  —— 引擎与托管侧统一变速，Lua 动画/渲染全覆盖
 static Il2CppMethodInfo *g_timeSetScale = NULL;
 static Il2CppMethodInfo *g_timeGetScale = NULL;
+// ⭐ 关键改动：改用 il2cpp_class_get_property_from_name("timeScale") → get/set 指向真实函数。
+//    旧版直接用 class_get_method_from_name("set_timeScale") 拿到的是映像外垃圾 MethodInfo。
+static void *g_timeSetFn = NULL;    // void (*)(float)
+static void *g_timeGetFn = NULL;    // float (*)(void)
+static void *g_timeSetProp = NULL;  // PropertyInfo*
+
 static void mx_time_warmup(void) {
     static int s_tried = 0;
-    if (g_timeSetScale || s_tried) return;
+    if (g_timeSetFn || s_tried) return;
     s_tried = 1;
     Il2CppClass *k = mx_class("UnityEngine", "Time");
-    if (!k) {
-        // 列出所有 image 名，便于判断是 image 没加载还是类名不同
-        Il2CppImage _imgs[256];
-        size_t n = mx_all_images((void **)_imgs, 256);
-        if (n && I.image_get_name) {
-            mlog(@"Time class NOT FOUND; %zu images loaded:", n);
-            for (size_t i = 0; i < n && i < 40; i++) {
-                const char *nm = I.image_get_name(_imgs[i]);
-                if (nm) mlog(@"   image[%zu] %s", i, nm);
-            }
+
+    // ---- 路线 1：属性法（首选）----
+    if (k && I.class_get_property_from_name) {
+        void *prop = I.class_get_property_from_name(k, "timeScale");
+        if (prop) {
+            g_timeSetProp = prop;
+            g_timeSetFn = *(void **)prop;            // PropertyInfo.get
+            g_timeGetFn = *(void **)((char *)prop + 8); // PropertyInfo.set
+            mlog(@"Time property 'timeScale' -> get=%p set=%p (valid=%d/%d)",
+                 g_timeGetFn, g_timeSetFn,
+                 g_timeGetFn ? mx_ptr_plausible((uintptr_t)g_timeGetFn) : 0,
+                 g_timeSetFn ? mx_ptr_plausible((uintptr_t)g_timeSetFn) : 0);
         } else {
-            mlog(@"Time class NOT FOUND (no assembly enumeration available)");
+            mlog(@"Time property 'timeScale' NOT FOUND");
+        }
+    }
+
+    // ---- 路线 2：MethodInfo 兜底（含布局自学习）----
+    if (!g_timeSetFn || !mx_ptr_plausible((uintptr_t)g_timeSetFn)) {
+        if (!k) { mlog(@"Time class NOT FOUND"); return; }
+        g_timeSetScale = mx_meth(k, "set_timeScale", 1);
+        g_timeGetScale = mx_meth(k, "get_timeScale", 0);
+        mlog(@"Time MethodInfo fallback: set=%p get=%p", g_timeSetScale, g_timeGetScale);
+        // 用 setter 的 MethodInfo 学布局（若尚未学到）
+        if (g_timeSetScale && g_mi.nameOff < 0) mx_layout_learn(g_timeSetScale, k, "set_timeScale");
+        if (g_timeSetScale && mx_mi_valid(g_timeSetScale, "set_timeScale")) {
+            g_timeSetFn = *(void **)((uint8_t *)g_timeSetScale + g_mi.ptrOff);
+            mlog(@"Time setter fn from MethodInfo: %p", g_timeSetFn);
+        }
+        if (g_timeGetScale && mx_mi_valid(g_timeGetScale, "get_timeScale")) {
+            g_timeGetFn = *(void **)((uint8_t *)g_timeGetScale + g_mi.ptrOff);
+        }
+    }
+    mlog(@"Time final: setFn=%p getFn=%p", g_timeSetFn, g_timeGetFn);
+}
+
+static int g_timeApplyLogged = 0;
+static void mx_time_apply(float mul) {
+    // ⭐ 优先走【真实函数指针】（属性法/布局法拿到的），直接调用，不经过 runtime_invoke，
+    //    避免装箱参数与返回值语义问题（旧版 readback 读到 1.05e-38 = 明显的内存解读错）。
+    if (g_timeSetFn && mx_ptr_plausible((uintptr_t)g_timeSetFn)) {
+        if (I.thread_current && !I.thread_current() && I.thread_attach)
+            I.thread_attach(I.domain_get());
+        ((void (*)(float))g_timeSetFn)(mul);
+        if (g_timeApplyLogged < 3) {
+            float back = 0;
+            if (g_timeGetFn && mx_ptr_plausible((uintptr_t)g_timeGetFn))
+                back = ((float (*)(void))g_timeGetFn)();
+            mlog(@"timeScale SET via fn -> %g (readback=%g)", mul, back);
+            g_timeApplyLogged++;
         }
         return;
     }
-    g_timeSetScale = mx_meth(k, "set_timeScale", 1);
-    g_timeGetScale = mx_meth(k, "get_timeScale", 0);
-    mlog(@"Time: set_timeScale=%p get_timeScale=%p", g_timeSetScale, g_timeGetScale);
-}
-
-static int g_timeInvokeFail = 0;
-static void mx_time_apply(float mul) {
-    if (!g_timeSetScale) { mlog(@"timeScale apply skipped: methodInfo null"); return; }
-    if (!I.runtime_invoke) { mlog(@"timeScale apply skipped: runtime_invoke null"); return; }
-    float v = mul;
-    void *args[1] = { &v };
-    void *exc = NULL;
-    if (I.thread_current && !I.thread_current() && I.thread_attach)
-        I.thread_attach(I.domain_get());
-    void *r = I.runtime_invoke(g_timeSetScale, NULL, args, &exc);
-    if (exc) {
-        if (++g_timeInvokeFail <= 3) mlog(@"timeScale invoke EXCEPTION (#%d)", g_timeInvokeFail);
-    } else if (g_timeInvokeFail < 100) {
-        g_timeInvokeFail = 100;   // 标记成功
-        mlog(@"timeScale invoke ok -> %g (ret=%p)", mul, r);
-    }
-    // 读回确认（若 set 有效，get 应立即反映）
-    if (g_timeGetScale && !exc) {
-        void *gexc = NULL;
-        void *g = I.runtime_invoke(g_timeGetScale, NULL, NULL, &gexc);
-        if (!gexc && g) {
-            float back = *(float *)g;
-            if (fabsf(back - mul) > 0.01f)
-                mlog(@"timeScale READBACK MISMATCH: want %g got %g", mul, back);
+    // 兜底：MethodInfo + runtime_invoke（并修正 args 解引用）
+    if (g_timeSetScale && I.runtime_invoke) {
+        float v = mul;
+        void *args[1] = { &v };
+        void *exc = NULL;
+        if (I.thread_current && !I.thread_current() && I.thread_attach)
+            I.thread_attach(I.domain_get());
+        void *r = I.runtime_invoke(g_timeSetScale, NULL, args, &exc);
+        if (exc) {
+            if (g_timeApplyLogged < 3) mlog(@"timeScale invoke EXCEPTION");
+        } else {
+            // ⚠️ 返回的是【装箱对象指针】，float 在 +0x10 处（Il2CppObject 头的 klass+monitor 之后）
+            float back = r ? *(float *)((uint8_t *)r + 0x10) : 0;
+            if (g_timeApplyLogged < 3)
+                mlog(@"timeScale invoke -> %g (boxed obj=%p, val@+0x10=%g)", mul, r, back);
         }
+        g_timeApplyLogged++;
+        return;
     }
+    if (g_timeApplyLogged < 3) { mlog(@"timeScale apply: NO usable setter"); g_timeApplyLogged++; }
 }
 
 #pragma mark - ============ 内嵌 Lua 注入源 ============
@@ -858,7 +929,8 @@ static void mx_install_lua_hook(void) {
         }
     }
     if (!g_updateMI) { mlog(@"LuaSvr Update/Start/doinit 均 NOT FOUND"); return; }
-    if (!mx_layout_probe(g_updateMI)) return;
+    if (!mx_layout_learn(g_updateMI, k, "Update")) return;
+    if (!mx_mi_valid(g_updateMI, "Update")) { mlog(@"LuaSvr.Update MI invalid after learn"); return; }
 
     uint8_t *b = (uint8_t *)g_updateMI;
     void **slot = (void **)(b + g_mi.ptrOff);
@@ -887,6 +959,7 @@ static void  mx_ensure_overlay(void);
 static void  mx_apply_speed(void);
 static void  mx_time_warmup(void);
 static void  mx_time_apply(float mul);
+static void  mx_time_apply(float mul);
 static void  mx_install_lua_hook(void);
 static void  mx_syms_load(void);
 static void *mx_sym_find(const char *name);
@@ -897,7 +970,8 @@ static size_t mx_all_images(void **outImg, size_t cap);
 static Il2CppImage mx_asm_image(void *asmObj);
 static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
 static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
-static int   mx_layout_probe(Il2CppMethodInfo *mi);
+static int   mx_layout_learn(Il2CppMethodInfo *mi, Il2CppClass *klass, const char *expectName);
+static int   mx_mi_valid(Il2CppMethodInfo *mi, const char *expectName);
 static int   mx_ptr_plausible(uintptr_t p);
 static const struct mach_header_64 *mx_unity_header(void);
 static void  mx_dump_found(void);
