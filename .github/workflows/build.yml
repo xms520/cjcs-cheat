@@ -1,0 +1,45 @@
+name: build-cjcs-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'CJCCheat.m'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CJCCheat.dylib (arm64, no theos)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -dynamiclib \
+            -fobjc-arc \
+            -O2 \
+            -Wall \
+            -o CJCCheat.dylib \
+            CJCCheat.m
+          file CJCCheat.dylib
+          ls -la CJCCheat.dylib
+
+      - name: Verify arm64 mach-o
+        run: |
+          vtool -show-build CJCCheat.dylib || true
+          md5 CJCCheat.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CJCCheat.dylib
+          path: CJCCheat.dylib

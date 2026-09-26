@@ -1,0 +1,7 @@
+Package: com.kun.cjcscheat
+Name: CJCCheat
+Version: 1.0
+Architecture: iphoneos-arm64
+Description: 创界传说 悬浮助手（无敌/秒杀/加速）— IL2CPP + SLua 双层注入
+Author: 昆哥儿科技
+Depiction: 无敌 / 秒杀 / 全局加速
