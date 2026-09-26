@@ -492,6 +492,25 @@ static int mx_ptr_plausible(uintptr_t p) {
 static mx_mi_layout_t g_mi = { -1, -1, -1 };
 
 // 校验一个 MethodInfo 是否可信：布局已知 + name 字段指向的字符串等于期望名
+// ⚠️ 只判「可读」不够：PropertyInfo 里存的是 MethodInfo*，不是函数指针。
+//    把它们当函数调用 → SIGBUS（实测 faultAddr 正好等于该地址）。
+//    真正的函数指针必须落在【可执行页】。
+static int mx_ptr_executable(uintptr_t p) {
+    if (p < 0x1000ULL) return 0;
+    if (p & 3) return 0;                       // arm64 指令 4 字节对齐
+    vm_address_t addr = (vm_address_t)p;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_port_t obj = MACH_PORT_NULL;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size,
+                                    VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &cnt, &obj);
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    if (kr != KERN_SUCCESS || addr > p) return 0;
+    return (info.protection & VM_PROT_EXECUTE) ? 1 : 0;
+}
+
 static int mx_mi_valid(Il2CppMethodInfo *mi, const char *expectName) {
     if (!mi || g_mi.nameOff < 0) return 0;
     // mi 自身也必须是可读内存
@@ -676,47 +695,79 @@ static void mx_time_warmup(void) {
     if (g_timeSetFn || s_tried) return;
     s_tried = 1;
     Il2CppClass *k = mx_class("UnityEngine", "Time");
+    if (!k) { mlog(@"Time class NOT FOUND"); return; }
 
-    // ---- 路线 1：属性法（首选）----
-    if (k && I.class_get_property_from_name) {
+    // ⚠️ 实测教训：
+    //   - class_get_method_from_name 返回的指针可能在映像外（不可靠）
+    //   - PropertyInfo 里存的 get/set 是 **MethodInfo***（描述符），不是函数指针；
+    //     当函数调用 → SIGBUS（faultAddr 正好 = 该地址）
+    //   正确路径：拿到 MethodInfo* → 用 mi layout 读 methodPointer（必须是可执行页）
+
+    // ---- 路线1：属性 → MethodInfo* → methodPointer ----
+    if (I.class_get_property_from_name && g_mi.nameOff >= 0) {
         void *prop = I.class_get_property_from_name(k, "timeScale");
         if (prop) {
-            g_timeSetProp = prop;
-            g_timeSetFn = *(void **)prop;            // PropertyInfo.get
-            g_timeGetFn = *(void **)((char *)prop + 8); // PropertyInfo.set
-            mlog(@"Time property 'timeScale' -> get=%p set=%p (valid=%d/%d)",
-                 g_timeGetFn, g_timeSetFn,
-                 g_timeGetFn ? mx_ptr_plausible((uintptr_t)g_timeGetFn) : 0,
-                 g_timeSetFn ? mx_ptr_plausible((uintptr_t)g_timeSetFn) : 0);
-        } else {
-            mlog(@"Time property 'timeScale' NOT FOUND");
+            Il2CppMethodInfo *pget = *(Il2CppMethodInfo **)prop;          // PropertyInfo.get
+            Il2CppMethodInfo *pset = *(Il2CppMethodInfo **)((char *)prop + 8); // PropertyInfo.set
+            mlog(@"Time prop: getMI=%p setMI=%p", pget, pset);
+            if (pset && mx_ptr_plausible((uintptr_t)pset))
+                g_timeSetFn = *(void **)((uint8_t *)pset + g_mi.ptrOff);
+            if (pget && mx_ptr_plausible((uintptr_t)pget))
+                g_timeGetFn = *(void **)((uint8_t *)pget + g_mi.ptrOff);
+            mlog(@"Time prop->fn: set=%p get=%p (exec=%d/%d)",
+                 g_timeSetFn, g_timeGetFn,
+                 g_timeSetFn ? mx_ptr_executable((uintptr_t)g_timeSetFn) : 0,
+                 g_timeGetFn ? mx_ptr_executable((uintptr_t)g_timeGetFn) : 0);
         }
     }
 
-    // ---- 路线 2：MethodInfo 兜底（含布局自学习）----
-    if (!g_timeSetFn || !mx_ptr_plausible((uintptr_t)g_timeSetFn)) {
-        if (!k) { mlog(@"Time class NOT FOUND"); return; }
-        g_timeSetScale = mx_meth(k, "set_timeScale", 1);
-        g_timeGetScale = mx_meth(k, "get_timeScale", 0);
-        mlog(@"Time MethodInfo fallback: set=%p get=%p", g_timeSetScale, g_timeGetScale);
-        // 用 setter 的 MethodInfo 学布局（若尚未学到）
-        if (g_timeSetScale && g_mi.nameOff < 0) mx_layout_learn(g_timeSetScale, k, "set_timeScale");
-        if (g_timeSetScale && mx_mi_valid(g_timeSetScale, "set_timeScale")) {
-            g_timeSetFn = *(void **)((uint8_t *)g_timeSetScale + g_mi.ptrOff);
-            mlog(@"Time setter fn from MethodInfo: %p", g_timeSetFn);
-        }
-        if (g_timeGetScale && mx_mi_valid(g_timeGetScale, "get_timeScale")) {
-            g_timeGetFn = *(void **)((uint8_t *)g_timeGetScale + g_mi.ptrOff);
+    // ---- 路线2：MethodInfo 兜底 ----
+    if (!g_timeSetFn || !mx_ptr_executable((uintptr_t)g_timeSetFn)) {
+        g_timeSetFn = NULL; g_timeGetFn = NULL;
+        Il2CppMethodInfo *ms = mx_meth(k, "set_timeScale", 1);
+        Il2CppMethodInfo *mg = mx_meth(k, "get_timeScale", 0);
+        if (ms && !mx_layout_learn(ms, k, "set_timeScale")) ms = NULL;
+        if (ms) g_timeSetFn = *(void **)((uint8_t *)ms + g_mi.ptrOff);
+        if (mg && g_mi.ptrOff >= 0) g_timeGetFn = *(void **)((uint8_t *)mg + g_mi.ptrOff);
+        mlog(@"Time MI->fn: set=%p get=%p", g_timeSetFn, g_timeGetFn);
+    }
+
+    // ---- 路线3：UnityManager 内部符号（最稳，符号表里确有）----
+    if (!g_timeSetFn || !mx_ptr_executable((uintptr_t)g_timeSetFn)) {
+        void *f = mx_sym_find("__ZN11TimeManager12SetTimeScaleEf");
+        if (f && mx_ptr_executable((uintptr_t)f)) {
+            g_timeSetFn = f;
+            mlog(@"Time setFn from TimeManager::SetTimeScale = %p", f);
         }
     }
-    mlog(@"Time final: setFn=%p getFn=%p", g_timeSetFn, g_timeGetFn);
+
+    // 符号表诊断（决定路线3可行性）
+    {
+        const char *names[] = {
+            "__ZN11TimeManager12SetTimeScaleEf",
+            "__Z29Time_Get_Custom_PropTimeScalev",
+            "__Z29Time_Set_Custom_PropTimeScalef",
+            "__Z29Time_Get_Custom_PropDeltaTimev",
+        };
+        for (int i = 0; i < 4; i++) {
+            void *f = mx_sym_find(names[i]);
+            mlog(@"symtab probe %s -> %p (exec=%d)", names[i], f,
+                 f ? mx_ptr_executable((uintptr_t)f) : -1);
+        }
+    }
+    if (g_timeSetFn && mx_ptr_executable((uintptr_t)g_timeSetFn)) {
+        mlog(@"Time READY: setFn=%p (executable)", g_timeSetFn);
+    } else {
+        g_timeSetFn = NULL;
+        mlog(@"Time FAILED: no executable setter found");
+    }
 }
 
 static int g_timeApplyLogged = 0;
 static void mx_time_apply(float mul) {
     // ⭐ 优先走【真实函数指针】（属性法/布局法拿到的），直接调用，不经过 runtime_invoke，
     //    避免装箱参数与返回值语义问题（旧版 readback 读到 1.05e-38 = 明显的内存解读错）。
-    if (g_timeSetFn && mx_ptr_plausible((uintptr_t)g_timeSetFn)) {
+    if (g_timeSetFn && mx_ptr_executable((uintptr_t)g_timeSetFn)) {
         if (I.thread_current && !I.thread_current() && I.thread_attach)
             I.thread_attach(I.domain_get());
         ((void (*)(float))g_timeSetFn)(mul);
@@ -1011,6 +1062,7 @@ static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
 static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
 static int   mx_layout_learn(Il2CppMethodInfo *mi, Il2CppClass *klass, const char *expectName);
 static int   mx_ptr_plausible(uintptr_t p);
+static int   mx_ptr_executable(uintptr_t p);
 static const struct mach_header_64 *mx_unity_header(void);
 static void  mx_dump_found(void);
 
