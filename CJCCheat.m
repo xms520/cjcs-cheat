@@ -1147,6 +1147,7 @@ static void mx_apply_speed(void) {
 
 #pragma mark - ============ 前置声明 ============
 static void  mx_ensure_overlay(void);
+static void  mx_dump_found(void);
 static void  mx_apply_speed(void);
 static void  mx_time_warmup(void);
 static void  mx_time_apply(float mul);
@@ -1163,7 +1164,6 @@ static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
 static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
 static int   mx_layout_learn(Il2CppMethodInfo *mi, Il2CppClass *klass, const char *expectName);
 static void  mx_lua_tick_inject(void);
-static void  mx_dump_found(void);
 static int   mx_ptr_plausible(uintptr_t p);
 static int   mx_ptr_executable(uintptr_t p);
 static const struct mach_header_64 *mx_unity_header(void);
