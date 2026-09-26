@@ -649,6 +649,8 @@ static struct {
     int            (*rawgeti)(lua_State *, int, long long);
     unsigned long long (*rawlen)(lua_State *, int);
     void           (*pushlightuserdata)(lua_State *, void *);
+    const char*    (*setupvalue)(lua_State *, int, int);
+    int            (*pcallk_raw)(lua_State *, int, int, int, int, void *);
 } L;
 
 static int mx_lua_load(void) {
@@ -673,6 +675,7 @@ static int mx_lua_load(void) {
         {"_lua_pushvalue",    (void **)&L.pushvalue},
         {"_lua_rawgeti",      (void **)&L.rawgeti},
         {"_lua_rawlen",       (void **)&L.rawlen},
+        {"_lua_setupvalue",   (void **)&L.setupvalue},
     };
     int miss = 0;
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
@@ -681,7 +684,7 @@ static int mx_lua_load(void) {
     }
     if (miss) return 0;
     ok = 1;
-    mlog(@"lua: 17/17 C API resolved");
+    mlog(@"lua: C API resolved (%s setupvalue)", L.setupvalue ? "with" : "NO");
     return 1;
 }
 
@@ -991,21 +994,51 @@ static size_t g_off_l       = (size_t)-1;    // SLua.LuaState.l_
 
 static void mx_inject_lua(lua_State *Ls) {
     if (!Ls || !mx_lua_load()) return;
+    if (!L.getglobal || !L.setupvalue) { mlog(@"lua: missing getglobal/setupvalue"); return; }
+
+    int base = L.gettop(Ls);
+
+    // 加载 chunk（"t" = 文本模式）
     if (L.L_loadbufferx(Ls, kLuaHook, strlen(kLuaHook), "@cjcs_hook", "t") != 0) {
         const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
         mlog(@"lua: loadbufferx FAILED: %s", e ? e : "?");
-        L.settop(Ls, -L.gettop(Ls));
+        L.settop(Ls, base);
         return;
     }
+
+    // ⭐ Lua 5.3 关键：主 chunk 的 1 号 upvalue 是 _ENV，必须显式设为全局表，
+    //    否则 chunk 内所有全局读写都落在 nil 上 →
+    //    "variable '__CJCS_INSTALLED' is not declared"（实测就是这个错）
+    L.getglobal(Ls, "_G");
+    if (L.type(Ls, -1) == 5 /* TABLE */) {
+        const char *up = L.setupvalue(Ls, -2, 1);   // chunk 在 -2，_ENV 在 -1
+        mlog(@"lua: _ENV set -> upvalue=%s", up ? up : "(null!)");
+        L.settop(Ls, -1);                            // 弹掉 _G
+    } else {
+        mlog(@"lua: _G not a table (type=%d) -> abort", L.type(Ls, -1));
+        L.settop(Ls, base);
+        return;
+    }
+
     if (L.pcallk(Ls, 0, -1, 0, 0, NULL) != 0) {
         const char *e = L.tolstring ? L.tolstring(Ls, -1, NULL) : "?";
         mlog(@"lua: pcallk FAILED: %s", e ? e : "?");
-        L.settop(Ls, -L.gettop(Ls));
+        L.settop(Ls, base);
         return;
     }
-    L.settop(Ls, -L.gettop(Ls));
+    L.settop(Ls, base);
+
+    // 回读自证：__CJCS_INSTALLED 真的设上了吗？
+    L.getglobal(Ls, "__CJCS_INSTALLED");
+    int okFlag = (L.type(Ls, -1) == 1 /* BOOLEAN */) ? 1 : 0;
+    L.settop(Ls, -1);
+    L.getglobal(Ls, "__CJCS_FOUND");
+    int foundType = L.type(Ls, -1);
+    L.settop(Ls, -1);
+
+    if (!okFlag) { mlog(@"lua: inject ran but __CJCS_INSTALLED missing -> chunk ineffective"); return; }
     g_luaInjected = 1;
-    mlog(@"lua: hook injected into game state %p", (void *)Ls);
+    mlog(@"lua: HOOK INJECTED into state %p (__CJCS_FOUND type=%d)", (void *)Ls, foundType);
 }
 
 static void mx_update_replacement(void *self, void *mi) {
