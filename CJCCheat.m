@@ -49,6 +49,10 @@
 #import <string.h>
 #import <stdint.h>
 
+// UnityFramework __TEXT 段大小（本机逆向实证：vmaddr=0 size=0x593c000）
+// 用途：判断某个函数指针是否落在 Unity 代码段内（methodPointer 合理性校验）
+#define kUnityTextSize 0x593c000
+
 #pragma mark - 日志（Documents/cjcs.log，可直接导出）
 static FILE *g_log = NULL;
 static void mlog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -225,16 +229,6 @@ typedef struct { void *target; void *replacement; void *orig; } mx_hook_t;
 static mx_hook_t g_hooks[256];
 static int       g_hookCount = 0;
 
-static void mx_ptr_write(void **slot, void *value) {
-    // 数据段可写；保险起见先确保页可写（失败也不致命）
-    uintptr_t page = (uintptr_t)slot & ~(uintptr_t)(vm_page_size - 1);
-    vm_prot_t cur = 0; vm_prot_t max = 0;
-    vm_address_t a = (vm_address_t)page;
-    if (vm_region_64(mach_task_self(), &a, (vm_size_t[]){0}, &max, NULL, NULL, NULL, NULL) != KERN_SUCCESS) {
-        // 忽略，直接写
-    }
-    *slot = value;
-}
 
 #pragma mark - ============ il2cpp 反射（全部来自内存符号表）============
 typedef void* Il2CppDomain;
@@ -328,22 +322,6 @@ static int mx_il2cpp_load(void) {
     return 1;
 }
 
-// 取程序集 image（按名字）
-static Il2CppImage mx_image_named(const char *asmName) {
-    if (!I.domain_get || !I.domain_get_assemblies) return NULL;
-    Il2CppDomain dom = I.domain_get();
-    size_t n = 0;
-    Il2CppImage *imgs = (Il2CppImage *)I.domain_get_assemblies(dom, &n);
-    if (!imgs) return NULL;
-    for (size_t i = 0; i < n; i++) {
-        if (!imgs[i]) continue;
-        const char *nm = I.class_get_name ? NULL : NULL;
-        (void)nm;
-        // il2cpp_assembly_get_image 拿到的是 image，名字要靠 il2cpp_image_get_name
-        // 这里用 domain_assembly_open 更直接（按名打开）
-    }
-    return NULL;
-}
 
 // 找类：先扫全部 image（Obfuz 下 image 顺序不保证），再按名打开
 static Il2CppClass *mx_find_class(const char *ns, const char *name) {
@@ -438,15 +416,10 @@ static mx_mi_layout_t g_mi = { -1, -1, -1 };
 
 static int mx_ptr_plausible(uintptr_t p) {
     if (p < 0x1000) return 0;
-    uintptr_t base = 0; size_t sz = 0;
-    // 只需落在 UnityFramework __TEXT 内：slide .. slide+0x593c000
-    extern const struct mach_header_64 *mx_unity_header(void);
     const struct mach_header_64 *mh = mx_unity_header();
     if (!mh) return 0;
-    base = (uintptr_t)mh;
-    // 用已知代码段大小粗判
-    sz = 0x593c000;
-    return (p >= base && p < base + sz);
+    uintptr_t base = (uintptr_t)mh;
+    return (p >= base && p < base + kUnityTextSize);
 }
 
 static int mx_layout_probe(Il2CppMethodInfo *mi) {
@@ -501,6 +474,9 @@ static struct {
     int            (*type)(lua_State *, int);
     void           (*createtable)(lua_State *, int, int);
     void           (*pushvalue)(lua_State *, int);
+    int            (*rawgeti)(lua_State *, int, long long);
+    unsigned long long (*rawlen)(lua_State *, int);
+    void           (*pushlightuserdata)(lua_State *, void *);
 } L;
 
 static int mx_lua_load(void) {
@@ -523,6 +499,8 @@ static int mx_lua_load(void) {
         {"_lua_type",         (void **)&L.type},
         {"_lua_createtable",  (void **)&L.createtable},
         {"_lua_pushvalue",    (void **)&L.pushvalue},
+        {"_lua_rawgeti",      (void **)&L.rawgeti},
+        {"_lua_rawlen",       (void **)&L.rawlen},
     };
     int miss = 0;
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
@@ -531,7 +509,7 @@ static int mx_lua_load(void) {
     }
     if (miss) return 0;
     ok = 1;
-    mlog(@"lua: 15/15 C API resolved");
+    mlog(@"lua: 17/17 C API resolved");
     return 1;
 }
 
@@ -584,12 +562,13 @@ static const char *kLuaHook =
 "  for i=1,#list do if string.find(s, list[i], 1, true) then return list[i] end end\n"
 "  return nil\n"
 "end\n"
+"local WRAPPED = setmetatable({}, { __mode = 'k' })\n"
 "local wrapped = 0\n"
 "local function wrapFn(tbl, key, path, kind)\n"
 "  local ok, f = pcall(function() return tbl[key] end)\n"
 "  if not ok or type(f) ~= 'function' then return end\n"
-"  if debug and debug.getinfo and not debug.getinfo(f, 'S').what:find('C') then end\n"
-"  if getmetatable and getmetatable(f) == 'CJCS_WRAPPED' then return end\n"
+"  if WRAPPED[f] then return end\n"
+"  WRAPPED[f] = true\n"
 "  local orig = f\n"
 "  tbl[key] = function(...)\n"
 "    local r = orig(...)\n"
@@ -601,7 +580,6 @@ static const char *kLuaHook =
 "    end\n"
 "    return r\n"
 "  end\n"
-"  pcall(function() setmetatable(tbl[key], { __name = 'CJCS_WRAPPED' }) end)\n"
 "  wrapped = wrapped + 1\n"
 "  FOUND[#FOUND+1] = path .. '.' .. key .. ' [' .. kind .. ']'\n"
 "end\n"
@@ -706,7 +684,6 @@ static void mx_update_replacement(void *self, void *mi) {
 
     // 每 ~30 帧下发开关到 Lua（__CJCS 表，无需文件 IO）
     if (g_luaInjected && g_L && (g_updateTicks % 30) == 0 && L.getglobal && L.pushboolean && L.setfield) {
-        extern volatile int g_inv, g_oneshot;
         L.getglobal(g_L, "__CJCS");
         if (L.type(g_L, -1) == 5 /* LUA_TTABLE */) {
             L.pushboolean(g_L, g_inv);
@@ -738,8 +715,6 @@ static void mx_install_lua_hook(void) {
 }
 
 #pragma mark - ============ 全局加速应用 tick ============
-static float g_speedTable[] = { 1.0f, 2.0f, 4.0f, 8.0f };
-static int   g_speedIdx = 0;
 
 static void mx_apply_speed(void) {
     float mul = g_speedTable[g_speedIdx];
@@ -748,6 +723,31 @@ static void mx_apply_speed(void) {
     mx_time_apply(mul);
     mlog(@"timeScale -> %g", mul);
 }
+
+#pragma mark - ============ 前置声明 ============
+static void  mx_build_window(void);
+static void  mx_apply_speed(void);
+static void  mx_time_warmup(void);
+static void  mx_time_apply(float mul);
+static void  mx_install_lua_hook(void);
+static void  mx_syms_load(void);
+static void *mx_sym_find(const char *name);
+static int   mx_il2cpp_load(void);
+static int   mx_lua_load(void);
+static Il2CppClass *mx_class(const char *ns, const char *name);
+static Il2CppMethodInfo *mx_meth(Il2CppClass *k, const char *name, int argc);
+static size_t mx_field_off(Il2CppClass *k, const char *name, Il2CppFieldInfo **out);
+static int   mx_layout_probe(Il2CppMethodInfo *mi);
+static int   mx_ptr_plausible(uintptr_t p);
+static const struct mach_header_64 *mx_unity_header(void);
+static void  mx_dump_found(void);
+
+// 面板开关状态（part6 的 LuaSvr hook 与 part7 的面板都要读）
+volatile int g_inv     = 0;   // 无敌
+volatile int g_oneshot = 0;   // 秒杀
+int          g_speedIdx = 0;  // 加速档位索引
+static const float g_speedTable[4] = { 1.0f, 2.0f, 4.0f, 8.0f };
+static float       g_speedMul = 1.0f;
 
 #pragma mark - ============ 悬浮 UI（独立 window + 穿透，Unity 系实证方案）============
 #define BALL_SIZE 58.0
@@ -758,13 +758,21 @@ static UIWindow *g_win   = nil;
 static UIView   *g_ball  = nil;
 static UIView   *g_panel = nil;
 
-volatile int g_inv = 0, g_oneshot = 0;
 
 @interface CJPassthrough : UIView @end
 @implementation CJPassthrough
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     UIView *v = [super hitTest:p withEvent:e];
     return (v == self) ? nil : v;   // 空白区放行 → 触摸穿透到游戏
+}
+@end
+
+// 让 window 的 root view 真正是一个 CJPassthrough（否则穿透失效）
+@interface CJRootVC : UIViewController @end
+@implementation CJRootVC
+- (void)loadView {
+    self.view = [[CJPassthrough alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    self.view.backgroundColor = [UIColor clearColor];
 }
 @end
 
@@ -859,10 +867,8 @@ static CJBox *g_box = nil;
         @try {
             if (!g_win || !g_win.rootViewController.view || g_ball.superview == nil) {
                 mlog(@"overlay lost, rebuild");
-                extern void mx_build_window(void);
                 mx_build_window();
             }
-            extern void mx_apply_speed(void);
             mx_apply_speed();
         } @catch (NSException *e) { mlog(@"keepTick exc %@", e.name); }
     }
@@ -870,7 +876,7 @@ static CJBox *g_box = nil;
 @end
 
 // --- 三个开关按钮 ---
-static UIButton *mx_btn(NSString *t, SEL a, CGFloat y) {
+static UIButton *mx_btn(NSString *t, id target, SEL a, CGFloat y) {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.frame = CGRectMake(12, y, PANEL_W - 24, 38);
     b.backgroundColor = mx_c(255, 255, 255, 0.10);
@@ -880,18 +886,23 @@ static UIButton *mx_btn(NSString *t, SEL a, CGFloat y) {
     [b setTitle:t forState:UIControlStateNormal];
     [b setTitleColor:mx_c(235, 235, 235, 1) forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [b addTarget:[CJBox shared] action:a forControlEvents:UIControlEventTouchUpInside];
+    [b addTarget:target action:a forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
 
-@interface CJPanel : UIView @end
+@interface CJPanel : UIView
+- (void)toggleInv;
+- (void)toggleOne;
+- (void)toggleSpd;
+- (void)refresh;
+- (void)close;
+@end
 @implementation CJPanel
 - (void)toggleInv  { g_inv = !g_inv;      [self refresh]; mlog(@"flag invincible=%d", g_inv); }
 - (void)toggleOne  { g_oneshot = !g_oneshot; [self refresh]; mlog(@"flag oneshot=%d", g_oneshot); }
-- (void)toggleSpd  { extern int g_speedIdx; g_speedIdx = (g_speedIdx + 1) % 4; [self refresh];
+- (void)toggleSpd  { g_speedIdx = (g_speedIdx + 1) % 4; [self refresh];
                      mlog(@"flag speedIdx=%d", g_speedIdx); }
 - (void)refresh {
-    extern int g_speedIdx;
     static const char *sp[4] = { "OFF", "x2", "x4", "x8" };
     UIButton *b1 = (UIButton *)[self viewWithTag:101];
     UIButton *b2 = (UIButton *)[self viewWithTag:102];
@@ -938,9 +949,9 @@ static void mx_build_panel(void) {
     [x addTarget:p action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
     [p addSubview:x];
 
-    UIButton *b1 = mx_btn(@"无敌  OFF", @selector(toggleInv), 54);  b1.tag = 101; [p addSubview:b1];
-    UIButton *b2 = mx_btn(@"秒杀  OFF", @selector(toggleOne), 98);  b2.tag = 102; [p addSubview:b2];
-    UIButton *b3 = mx_btn(@"加速  OFF", @selector(toggleSpd), 138); b3.tag = 103; [p addSubview:b3];
+    UIButton *b1 = mx_btn(@"无敌  OFF", p, @selector(toggleInv), 54);  b1.tag = 101; [p addSubview:b1];
+    UIButton *b2 = mx_btn(@"秒杀  OFF", p, @selector(toggleOne), 98);  b2.tag = 102; [p addSubview:b2];
+    UIButton *b3 = mx_btn(@"加速  OFF", p, @selector(toggleSpd), 138); b3.tag = 103; [p addSubview:b3];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[CJBox shared] action:@selector(panelDrag:)];
     [p addGestureRecognizer:pan];
@@ -954,12 +965,11 @@ static void mx_build_window(void) {
 
     g_win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     g_win.windowLevel = CGFLOAT_MAX;
-    g_win.rootViewController = [UIViewController new];
+    g_win.rootViewController = [CJRootVC new];
     g_win.backgroundColor = [UIColor clearColor];
     g_win.hidden = NO;
 
     CJPassthrough *root = (CJPassthrough *)g_win.rootViewController.view;
-    root.backgroundColor = [UIColor clearColor];
 
     g_ball = [[UIView alloc] initWithFrame:CGRectMake(0, 0, BALL_SIZE, BALL_SIZE)];
     g_ball.center = CGPointMake(root.bounds.size.width - BALL_SIZE/2 - 18, 150);
@@ -1002,14 +1012,12 @@ static void mx_stage(void) {
             }
             case 1:
                 g_ctorStage = 2;
-                if (!mx_time_warmup_ok()) { mx_time_warmup(); }
+                if (!g_timeSetScale) mx_time_warmup();
                 mx_install_lua_hook();
                 mx_apply_speed();
                 break;
             default: {
                 g_ctorStage = 3;
-                extern int g_luaInjected;
-                extern void mx_dump_found(void);
                 mlog(@"stage3: luaInjected=%d timeSet=%p timeGet=%p",
                      g_luaInjected, g_timeSetScale, g_timeGetScale);
                 if (g_luaInjected) mx_dump_found();
@@ -1025,7 +1033,6 @@ static void mx_stage(void) {
     }
 }
 
-static int mx_time_warmup_ok(void) { return g_timeSetScale != NULL; }
 
 #pragma mark - 导出 Lua 自发现结果（下次精确定位用）
 static void mx_dump_found(void) {
@@ -1035,12 +1042,10 @@ static void mx_dump_found(void) {
     // 表里有 n 个字符串元素，逐个取
     NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/cjcs_lua_found.txt"];
     NSMutableString *out = [NSMutableString string];
-    extern int (*lua_rawgeti_p)(lua_State *, int, long long);
-    extern int (*lua_rawlen_p)(lua_State *);
-    if (!lua_rawgeti_p || !lua_rawlen_p) { mlog(@"dump: rawgeti/rawlen missing"); return; }
-    int n = lua_rawlen_p(g_L);
+    if (!L.rawgeti || !L.rawlen) { mlog(@"dump: rawgeti/rawlen missing"); return; }
+    int n = (int)L.rawlen(g_L, -1);
     for (int i = 1; i <= n && i < 800; i++) {
-        lua_rawgeti_p(g_L, -1, i);
+        L.rawgeti(g_L, -1, i);
         size_t len = 0;
         const char *s = L.tolstring(g_L, -1, &len);
         if (s) [out appendFormat:@"%s\n", s];
