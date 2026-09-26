@@ -1065,7 +1065,20 @@ static void mx_dump_found(void) {
 #pragma mark - UI tick（1s）
 static void mx_ui_tick(void) { @autoreleasepool { @try { mx_build_window(); } @catch (NSException *e) {} } }
 
-__attribute__((constructor)) static void cjcs_ctor(void) {
+static void cjcs_boot(void);
+
+__attribute__((constructor)) static void cjcs_ctor(void) { cjcs_boot(); }
+
+// 双保险：ObjC +load 在 dylib 被 dyld 载入时必定执行（不依赖 __mod_init_func / __init_offsets）
+@interface MXLoader : NSObject @end
+@implementation MXLoader
++ (void)load { cjcs_boot(); }
+@end
+
+static void cjcs_boot(void) {
+    static int booted = 0;
+    if (booted) return;      // 两个入口只跑一次
+    booted = 1;
     @autoreleasepool {
         mlog(@"================ CJCCheat v1 boot ================");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
