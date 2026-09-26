@@ -946,9 +946,30 @@ static void mx_install_lua_hook(void) {
             if (g_updateMI) mlog(@"LuaSvr.Update/Start missing -> fallback to doinit(2)");
         }
     }
-    if (!g_updateMI) { mlog(@"LuaSvr Update/Start/doinit 均 NOT FOUND"); return; }
+    if (!g_updateMI) {
+        // 决定性诊断：列出 LuaSvr 的真实方法名（Obfuz 可能已改名）
+        mlog(@"LuaSvr Update/Start/doinit 均 NOT FOUND -> dumping class methods:");
+        if (I.class_get_methods && I.method_get_name) {
+            void *it = NULL; Il2CppMethodInfo *mm; int n = 0;
+            while ((mm = I.class_get_methods(k, &it)) != NULL && n < 120) {
+                const char *mn = I.method_get_name(mm);
+                mlog(@"   LuaSvr[%d] %s (pc=%d)", n, mn ? mn : "?",
+                     I.method_get_param_count ? I.method_get_param_count(mm) : -1);
+                n++;
+            }
+            mlog(@"   (%d methods dumped)", n);
+        } else {
+            mlog(@"   (iterator API unavailable)");
+        }
+        return;
+    }
     if (!mx_layout_learn(g_updateMI, k, "Update")) return;
-    if (!mx_mi_valid(g_updateMI, "Update")) { mlog(@"LuaSvr.Update MI invalid after learn"); return; }
+    if (!mx_mi_valid(g_updateMI, "Update")) {
+        // 名字对不上（Obfuz 改名）：只要布局学出来了就直接用
+        mlog(@"LuaSvr.Update MI name mismatch, but layout=%d/%d/%d -> proceed anyway",
+             g_mi.ptrOff, g_mi.nameOff, g_mi.klassOff);
+        if (g_mi.ptrOff < 0) return;
+    }
 
     uint8_t *b = (uint8_t *)g_updateMI;
     void **slot = (void **)(b + g_mi.ptrOff);
