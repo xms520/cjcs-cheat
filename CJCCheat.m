@@ -75,6 +75,51 @@ static void mlog(NSString *fmt, ...) {
     if (g_log) { fprintf(g_log, "[CJCS] %s\n", s.UTF8String); fflush(g_log); }
 }
 
+
+#pragma mark - ============ 崩溃自诊断（信号处理器 + 阶段标记）============
+// 目的：SIGSEGV/SIGBUS 时把「最后执行到哪个阶段 + 出错地址」写进日志，
+// 避免只看到「日志断在某行」而无法区分是崩溃、卡死还是没跑到。
+#import <signal.h>
+static volatile int  g_step = 0;
+static int           g_crashfd = -1;
+static const char   *g_stepName[] = {
+    "none", "boot", "symtab", "api-resolve", "domain-get", "image-enum",
+    "time-warmup", "time-apply", "lua-class", "lua-method", "lua-swap",
+    "lua-inject", "ui", "tick"
+};
+static void mx_setstep(int n) { g_step = n; }
+
+static void mx_sig_handler(int sig, siginfo_t *info, void *ctx) {
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "\n[CJCS] !!! SIGNAL %d (%s) at step=%d(%s) faultAddr=%p\n",
+        sig,
+        sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" :
+        sig == SIGABRT ? "SIGABRT" : sig == SIGTRAP ? "SIGTRAP" : "SIG?",
+        g_step, (g_step >= 0 && g_step < (int)(sizeof(g_stepName)/sizeof(g_stepName[0])))
+                ? g_stepName[g_step] : "?",
+        info ? info->si_addr : NULL);
+    if (g_crashfd >= 0) write(g_crashfd, buf, n);
+    // 恢复默认处理并重发，保证系统仍能生成 .ips
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void mx_install_sig_handler(void) {
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/cjcs.log"];
+    g_crashfd = open(p.UTF8String, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = mx_sig_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    mlog(@"sig handler installed (fd=%d)", g_crashfd);
+}
+
 #pragma mark - 内嵌头像（用户上传图 → 256x256 JPEG q85 = 14081B → base64 4 段）
 static NSString * const kAvatarB64 =
 @"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"
@@ -359,9 +404,20 @@ static int mx_il2cpp_load(void) {
         {"_il2cpp_class_get_static_field_data",(void **)&I.class_get_static_field_data},
         {"_il2cpp_runtime_class_init",         (void **)&I.class_init},
     };
-    int miss = 0, optional_miss = 0;
+    int miss = 0, optional_miss = 0, outrange = 0;
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
         *t[i].p = mx_sym_find(t[i].n);
+        if (*t[i].p) {
+            uintptr_t a = (uintptr_t)*t[i].p;
+            const struct mach_header_64 *mh = mx_unity_header();
+            uintptr_t base = (uintptr_t)mh;
+            if (base && !(a >= base && a < base + kUnityTextSize)) {
+                outrange++;
+                mlog(@"il2cpp: OUT OF RANGE %s -> %p (unity base=%p)", t[i].n, (void *)a, mh);
+            } else {
+                mlog(@"il2cpp: %s -> %p", t[i].n, (void *)a);
+            }
+        }
         if (!*t[i].p) {
             // class_init / image_get_filename 等属可选 API，缺了不致命
             int optional = (!strcmp(t[i].n, "_il2cpp_runtime_class_init") ||
@@ -373,6 +429,7 @@ static int mx_il2cpp_load(void) {
     }
     if (miss) { mlog(@"il2cpp: %d/%zu required missing -> abort", miss, sizeof(t)/sizeof(t[0])); return 0; }
     if (optional_miss) mlog(@"il2cpp: %d optional missing (ok)", optional_miss);
+    if (outrange) { mlog(@"il2cpp: %d out-of-range -> abort (地址换算异常)", outrange); return 0; }
     ok = 1;
     mlog(@"il2cpp: %zu API resolved from in-memory symtab", sizeof(t)/sizeof(t[0]));
     return 1;
@@ -1103,31 +1160,55 @@ static void mx_stage(void) {
         @try {
             switch (g_ctorStage) {
             case 0: {
+                // 阶段A：只做最保险的符号表（已验证正确）
                 g_ctorStage = 1;
                 mlog(@"ctor: pid=%d bid=%@", getpid(), [[NSBundle mainBundle] bundleIdentifier] ?: @"?");
+                mx_setstep(2);            // symtab
                 mx_syms_load();
                 mlog(@"sym: %u symbols indexed", g_symCount);
-                if (!mx_il2cpp_load()) { mlog(@"stage1: il2cpp API missing -> UI only"); break; }
-                mlog(@"stage1: domain=%p", I.domain_get ? I.domain_get() : NULL);
-                mlog(@"stage1: enumerating images ...");
-                {
-                    Il2CppImage _im[256];
-                    size_t _n = mx_all_images(_im, 256);
-                    mlog(@"stage1: %zu images available", _n);
-                }
-                mlog(@"stage1: time warmup ...");
-                mx_time_warmup();
-                mlog(@"stage1: lua hook install ...");
-                mx_install_lua_hook();
-                mlog(@"stage1: done");
+                mx_setstep(0);
                 break;
             }
-            case 1:
+            case 1: {
+                // 阶段B：只解析 API 地址 + 校验范围，不调用
                 g_ctorStage = 2;
-                if (!g_timeSetScale) mx_time_warmup();
+                mx_setstep(3);            // api-resolve
+                if (!mx_il2cpp_load()) { mlog(@"stageB: il2cpp API missing -> UI only"); break; }
+                mx_setstep(0);
+                mlog(@"stageB: API addresses ok");
+                break;
+            }
+            case 2: {
+                // 阶段C：单独试 domain_get
+                g_ctorStage = 3;
+                mx_setstep(4);            // domain-get
+                Il2CppDomain dom = I.domain_get ? I.domain_get() : NULL;
+                mlog(@"stageC: domain=%p", dom);
+                mx_setstep(5);            // image-enum
+                Il2CppImage _im[256];
+                size_t _n = mx_all_images(_im, 256);
+                mlog(@"stageC: %zu images available", _n);
+                mx_setstep(0);
+                break;
+            }
+            case 3: {
+                // 阶段D：Time 反射
+                g_ctorStage = 4;
+                mx_setstep(6);            // time-warmup
+                mx_time_warmup();
+                mx_setstep(0);
+                mlog(@"stageD: time warmup done");
+                break;
+            }
+            default: {
+                // 阶段E：Lua 注入
+                g_ctorStage = 5;
+                mx_setstep(8);            // lua-class
                 mx_install_lua_hook();
+                mx_setstep(0);
                 mx_apply_speed();
                 break;
+            }
             default: {
                 g_ctorStage = 3;
                 mlog(@"stage3: luaInjected=%d timeSet=%p timeGet=%p",
@@ -1189,19 +1270,23 @@ static void cjcs_boot(void) {
     booted = 1;
     @autoreleasepool {
         mlog(@"================ CJCCheat v1 boot ================");
+        mx_install_sig_handler();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             mx_stage();
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 mx_stage();
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     mx_stage();
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        mx_stage();
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                         mx_stage();
                         mx_ensure_overlay();
                         [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t){ mx_ui_tick(); }];
                         [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t){
                             [[CJBox shared] keepTick];
                         }];
+                        });
                     });
                 });
             });
