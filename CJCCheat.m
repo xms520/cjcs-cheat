@@ -53,6 +53,13 @@
 // 用途：判断某个函数指针是否落在 Unity 代码段内（methodPointer 合理性校验）
 #define kUnityTextSize 0x593c000
 
+// ============ 全局开关状态（唯一一处定义，供 LuaSvr hook / 面板 / 加速 tick 共享）============
+volatile int g_inv      = 0;   // 无敌
+volatile int g_oneshot  = 0;   // 秒杀
+int          g_speedIdx = 0;   // 加速档位（0=OFF 1=x2 2=x4 3=x8）
+static const float g_speedTable[4] = { 1.0f, 2.0f, 4.0f, 8.0f };
+static float       g_speedMul = 1.0f;
+
 #pragma mark - 日志（Documents/cjcs.log，可直接导出）
 static FILE *g_log = NULL;
 static void mlog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -269,6 +276,8 @@ typedef struct {
     void              (*gc_disable)(void);
     size_t            (*image_get_class_count)(Il2CppImage);
     Il2CppClass*      (*image_get_class)(Il2CppImage, size_t);
+    const char*       (*image_get_name)(Il2CppImage);
+    const char*       (*image_get_filename)(Il2CppImage);
     void*             (*class_get_static_field_data)(Il2CppClass *);
     void              (*class_init)(Il2CppClass *);
 } mx_il2cpp_t;
@@ -307,6 +316,8 @@ static int mx_il2cpp_load(void) {
         {"_il2cpp_thread_current",             (void **)&I.thread_current},
         {"_il2cpp_gc_disable",                 (void **)&I.gc_disable},
         {"_il2cpp_image_get_class_count",      (void **)&I.image_get_class_count},
+        {"_il2cpp_image_get_name",             (void **)&I.image_get_name},
+        {"_il2cpp_image_get_filename",         (void **)&I.image_get_filename},
         {"_il2cpp_image_get_class",            (void **)&I.image_get_class},
         {"_il2cpp_class_get_static_field_data",(void **)&I.class_get_static_field_data},
         {"_il2cpp_class_init",                 (void **)&I.class_init},
@@ -318,7 +329,7 @@ static int mx_il2cpp_load(void) {
     }
     if (miss) { mlog(@"il2cpp: %d/%zu missing -> abort", miss, sizeof(t)/sizeof(t[0])); return 0; }
     ok = 1;
-    mlog(@"il2cpp: 30/30 API resolved from in-memory symtab");
+    mlog(@"il2cpp: %zu API resolved from in-memory symtab", sizeof(t)/sizeof(t[0]));
     return 1;
 }
 
@@ -518,8 +529,6 @@ static int mx_lua_load(void) {
 //   UnityEngine.Time.set_timeScale(float)  —— 引擎与托管侧统一变速，Lua 动画/渲染全覆盖
 static Il2CppMethodInfo *g_timeSetScale = NULL;
 static Il2CppMethodInfo *g_timeGetScale = NULL;
-static float g_speedMul = 1.0f;
-
 static void mx_time_warmup(void) {
     Il2CppClass *k = mx_class("UnityEngine", "Time");
     if (!k) { mlog(@"Time class NOT FOUND"); return; }
@@ -743,11 +752,6 @@ static const struct mach_header_64 *mx_unity_header(void);
 static void  mx_dump_found(void);
 
 // 面板开关状态（part6 的 LuaSvr hook 与 part7 的面板都要读）
-volatile int g_inv     = 0;   // 无敌
-volatile int g_oneshot = 0;   // 秒杀
-int          g_speedIdx = 0;  // 加速档位索引
-static const float g_speedTable[4] = { 1.0f, 2.0f, 4.0f, 8.0f };
-static float       g_speedMul = 1.0f;
 
 #pragma mark - ============ 悬浮 UI（独立 window + 穿透，Unity 系实证方案）============
 #define BALL_SIZE 58.0
