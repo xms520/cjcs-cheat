@@ -986,6 +986,9 @@ static int mx_is_candidate(const char *fn) {
     return 0;
 }
 
+// ⚠️ SIGABRT 根因（真机实证）：lua_next 迭代中调用 lua_tolstring 取 key 是【危险】的 ——
+//   对数字键它会【就地转换】栈上的值，破坏 next 的迭代状态 → Lua 内部断言 → SIGABRT。
+//   修法：先判 lua_type(key)==LUA_TSTRING 再取字符串；全程用绝对下标 + 绝对 settop。
 static void mx_lua_dump_tree(lua_State *Ls) {
     if (!Ls || !mx_lua_load()) return;
     if (!L.rawgeti || !L.rawget || !L.next || !L.pushnil || !L.pushstring || !L.type) {
@@ -997,100 +1000,93 @@ static void mx_lua_dump_tree(lua_State *Ls) {
     if (!g_dump) { mlog(@"lua dump: cannot open file"); return; }
     setvbuf(g_dump, NULL, _IOLBF, 0);
 
-    int base = L.gettop(Ls);
-    fprintf(g_dump, "# CJCS Lua structure dump\n");
+    const int base = L.gettop(Ls);
+    fprintf(g_dump, "# CJCS Lua structure dump (pure-C, rawget/next)\n");
 
-    // [1] registry[2] = 真实全局表（不走元方法）
-    L.rawgeti(Ls, LUA_REGISTRYINDEX_C, LUA_RIDX_GLOBALS_C);   // [G]
-    int gIdx = L.gettop(Ls);
-    if (L.type(Ls, gIdx) != LUA_TTABLE_C) {
-        mlog(@"lua dump: registry globals type=%d (not table)", L.type(Ls, gIdx));
+    // ---- registry[LUA_RIDX_GLOBALS] = 真实全局表（绝对下标 base+1）----
+    L.rawgeti(Ls, LUA_REGISTRYINDEX_C, LUA_RIDX_GLOBALS_C);
+    const int gIdx = base + 1;
+    if (L.gettop(Ls) < gIdx || L.type(Ls, gIdx) != LUA_TTABLE_C) {
         fprintf(g_dump, "ABORT: registry globals type=%d\n", L.type(Ls, gIdx));
         L.settop(Ls, base); return;
     }
-    // 顺手报告 globals 里可疑名字的真实类型（解释 v4 的报错）
+    // 标准库类型审计（用 rawget，不碰元方法）
     {
-        const char *probe[] = {"string","table","math","package","require","pcall","type","pairs","_G"};
+        const char *probe[] = {"string","table","math","package","require","pcall","type","pairs","tostring","select","error"};
         for (size_t i = 0; i < sizeof(probe)/sizeof(probe[0]); i++) {
             L.pushstring(Ls, probe[i]);
             L.rawget(Ls, gIdx);
             int t = L.type(Ls, -1);
-            fprintf(g_dump, "global %-8s rawget type=%d (5=table 6=function)\n", probe[i], t);
-            if (t == 2) {   // 字符串
-                size_t n = 0;
-                const char *v = L.tolstring ? L.tolstring(Ls, -1, &n) : NULL;
-                if (v) fprintf(g_dump, "    value = \"%.60s\"\n", v);
-            }
+            fprintf(g_dump, "global %-8s rawget type=%d\n", probe[i], t);
             L.settop(Ls, -1);
         }
     }
 
-    // [2] G.package.loaded（模块表）
-    L.pushstring(Ls, "package");
-    L.rawget(Ls, gIdx);                       // [G][pkg]
-    int pIdx = L.gettop(Ls);
+    // ---- 取模块表：package.loaded，失败则 registry["_LOADED"] ----
     int lIdx = -1;
+    L.pushstring(Ls, "package");
+    L.rawget(Ls, gIdx);                                  // base+2
+    const int pIdx = base + 2;
     if (L.type(Ls, pIdx) == LUA_TTABLE_C) {
         L.pushstring(Ls, "loaded");
-        L.rawget(Ls, pIdx);                   // [G][pkg][loaded]
-        lIdx = L.gettop(Ls);
-    } else {
-        // package 被代理 → 直接从 registry["_LOADED"] 拿（Lua 5.3+ 标准位置）
-        L.settop(Ls, -1);
-        L.pushstring(Ls, "_LOADED");
-        L.rawget(Ls, LUA_REGISTRYINDEX_C);
-        lIdx = L.gettop(Ls);
-        fprintf(g_dump, "package unavailable -> registry['_LOADED'] type=%d\n", L.type(Ls, lIdx));
+        L.rawget(Ls, pIdx);                              // base+3
+        lIdx = base + 3;
     }
     if (lIdx < 0 || L.type(Ls, lIdx) != LUA_TTABLE_C) {
-        mlog(@"lua dump: no module table found");
-        L.settop(Ls, base); return;
+        L.settop(Ls, pIdx - 1);                          // 清掉 pkg
+        L.pushstring(Ls, "_LOADED");
+        L.rawget(Ls, LUA_REGISTRYINDEX_C);               // base+2
+        lIdx = base + 2;
+        fprintf(g_dump, "using registry['_LOADED'] type=%d\n", L.type(Ls, lIdx));
+    }
+    if (L.type(Ls, lIdx) != LUA_TTABLE_C) {
+        mlog(@"lua dump: no module table"); L.settop(Ls, base); return;
     }
 
-    // [3] 遍历模块
+    // ---- 遍历模块（严格绝对下标）----
+    const int k1 = lIdx + 1;                             // 当前 key 槽
     L.pushnil(Ls);
-    while (L.next(Ls, lIdx)) {                // [..][k][v]
-        size_t klen = 0;
-        const char *mod = L.tolstring ? L.tolstring(Ls, -2, &klen) : NULL;
-        int vt = L.type(Ls, -1);
-        if (mod && vt == LUA_TTABLE_C) {
-            g_modCount++;
-            fprintf(g_dump, "=== module %s\n", mod);
-            int vIdx = L.gettop(Ls);          // v 的绝对位置
-            L.pushnil(Ls);
-            int cnt = 0;
-            while (L.next(Ls, vIdx) && cnt < 400) {   // [..][v][k2][v2]
-                size_t flen = 0;
-                const char *fn = L.tolstring ? L.tolstring(Ls, -2, &flen) : NULL;
-                int t2 = L.type(Ls, -1);
-                if (fn) {
-                    if (t2 == LUA_TFUNCTION_C) {
-                        g_fnCount++;
-                        if (mx_is_candidate(fn)) {
-                            g_candCount++;
-                            fprintf(g_dump, "  [CAND] %s\n", fn);
-                        } else if (cnt < 60) {
-                            fprintf(g_dump, "  %s()\n", fn);
+    while (L.next(Ls, lIdx)) {                           // [k1][v1]
+        const int v1 = k1 + 1;
+        if (L.type(Ls, k1) == 2) {                       // ⭐ 只对【字符串键】取内容
+            size_t klen = 0;
+            const char *mod = L.tolstring(Ls, k1, &klen);
+            if (mod && L.type(Ls, v1) == LUA_TTABLE_C) {
+                g_modCount++;
+                fprintf(g_dump, "=== module %s\n", mod);
+                const int k2 = v1 + 1;
+                L.pushnil(Ls);
+                while (L.next(Ls, v1)) {                 // [k2][v2]
+                    const int v2 = k2 + 1;
+                    if (L.type(Ls, k2) == 2) {
+                        size_t flen = 0;
+                        const char *fn = L.tolstring(Ls, k2, &flen);
+                        int t2 = L.type(Ls, v2);
+                        if (fn && t2 == LUA_TFUNCTION_C) {
+                            g_fnCount++;
+                            if (mx_is_candidate(fn)) {
+                                g_candCount++;
+                                fprintf(g_dump, "  [CAND] %s\n", fn);
+                            }
                         }
-                    } else if (t2 == LUA_TTABLE_C && cnt < 60) {
-                        fprintf(g_dump, "  %s{}\n", fn);
                     }
+                    L.settop(Ls, k2);                    // 只弹 v2，保留 k2 给 next
                 }
-                L.settop(Ls, -1);             // pop v2, 保留 k2 供 next
-                cnt++;
+                // next 返回 0 时已自动 pop k2 → 栈回到 v1
             }
-            L.settop(Ls, -1);                 // pop k2
         }
-        L.settop(Ls, -1);                     // pop v, 保留 k 供外层 next
+        L.settop(Ls, k1);                                // 弹 v1，保留 k1 给 next
+        if (g_modCount >= 1500) break;                   // 规模上限，防卡死
     }
     L.settop(Ls, base);
     fprintf(g_dump, "\n# summary: modules=%d functions=%d candidates=%d\n",
             g_modCount, g_fnCount, g_candCount);
     fflush(g_dump);
-    mlog(@"lua dump DONE: modules=%d functions=%d candidates=%d -> Documents/cjcs_lua_dump.txt",
+    mlog(@"lua dump DONE: modules=%d functions=%d candidates=%d",
          g_modCount, g_fnCount, g_candCount);
-    g_luaInjected = 1;    // 标记已完成（不再重试）
+    g_luaInjected = 1;
 }
+
 
 static void mx_inject_lua(lua_State *Ls) { mx_lua_dump_tree(Ls); }
 
