@@ -974,6 +974,7 @@ static size_t g_off_l       = (size_t)-1;    // SLua.LuaState.l_
 
 static FILE *g_dump = NULL;
 static int   g_modCount = 0, g_fnCount = 0, g_candCount = 0;
+static int   g_luaProbeDone = 0;
 static const char *kCand[] = {
     "hurt","Hurt","damage","Damage","hp","Hp","HP","attack","Attack",
     "dead","Dead","die","Die","alive","attr","Attr","hpMax","maxHp","curHp",
@@ -989,101 +990,117 @@ static int mx_is_candidate(const char *fn) {
 // ⚠️ SIGABRT 根因（真机实证）：lua_next 迭代中调用 lua_tolstring 取 key 是【危险】的 ——
 //   对数字键它会【就地转换】栈上的值，破坏 next 的迭代状态 → Lua 内部断言 → SIGABRT。
 //   修法：先判 lua_type(key)==LUA_TSTRING 再取字符串；全程用绝对下标 + 绝对 settop。
+// ⚠️ 演进史（真机逐层实证）：
+//   v6 纯 C 遍历（rawget + lua_next）→ 打印 1 个模块后 SIGABRT @0x1bafbbbbc
+//   v7 给 key 加 lua_type==STRING 判断 → dump 连 "=== module" 都没打印就 SIGABRT（同址）
+//   ⇒ 结论：本游戏用的是【改造过的 Lua】（非原版 5.3.4），lua_next 的迭代契约不成立，
+//     任何 lua_next 调用都会踩到内部断言。**彻底放弃 lua_next**。
+//   本版：全部改用【按名字单点 rawget 探测】—— 单次查表无迭代状态，
+//         是 Lua 里最安全的操作，代理/加固/改造都拦不住。
+static const char *kModProbe[] = {
+    "Fight/LocalGame","Fight.LocalGame","Fight/LocalGame.lua",
+    "Fight/ServerGame","Fight.ServerGame",
+    "Fight/GameInterface","Fight.GameInterface","Fight/FightDeployCmp","Fight.RecordGame",
+    "Game/GUnit/GUnitAttrCmp","Game.GUnit.GUnitAttrCmp","Game/GUnit/GUnit",
+    "Game/GSpell/GSpellDamage","Game.GSpell.GSpellDamage","Game/GSpell/GSpell",
+    "Common/data_mgr","Common.data_mgr","Common/Formula","Common.Formula",
+    "Common/GlobalTypesAndFuncs","Common.EventHub","Common/DataBinding",
+    "Data/MonsterAttrData","Data.MonsterAttrData","Data/AttributeData","Data.AttributeData",
+    "Data/AttrParamData","Data/UnitData","Data/HeroData","Data/RoleData",
+    "GameEntry","Main","Mgrs/GameMgr","Mgrs.ObjectMgr","Scene/SceneMgr",
+};
+static const char *kFnProbe[] = {
+    "calcDamage","calDamage","CalcDamage","CalculateDamage","getDamage","GetDamage",
+    "damage","Damage","onDamage","OnDamage","dealDamage","DealDamage","hurt","Hurt",
+    "onHurt","OnHurt","setHp","SetHp","getHp","GetHp","SubHp","subHp","AddHp",
+    "reduceHp","ReduceHp","hp","Hp","HP","maxHp","MaxHp","curHp","CurHp",
+    "dead","Dead","die","Die","onDead","OnDead","isDead","IsDead","alive","Alive",
+    "attack","Attack","onAttack","OnAttack","attr","Attr","getAttr","GetAttr",
+    "init","Init","ctor","New","create","Create","load","Load","update","Update",
+};
+
 static void mx_lua_dump_tree(lua_State *Ls) {
     if (!Ls || !mx_lua_load()) return;
-    if (!L.rawgeti || !L.rawget || !L.next || !L.pushnil || !L.pushstring || !L.type) {
-        mlog(@"lua dump: required API missing"); return;
+    if (!L.rawgeti || !L.rawget || !L.pushstring || !L.type) {
+        mlog(@"lua probe: required API missing"); return;
     }
+    if (g_luaProbeDone) return;
+    g_luaProbeDone = 1;
+
     const char *dp = [NSHomeDirectory() stringByAppendingPathComponent:
                       @"Documents/cjcs_lua_dump.txt"].UTF8String;
-    if (!g_dump) g_dump = fopen(dp, "w");
-    if (!g_dump) { mlog(@"lua dump: cannot open file"); return; }
-    setvbuf(g_dump, NULL, _IOLBF, 0);
+    FILE *f = fopen(dp, "w");
+    if (!f) { mlog(@"lua probe: cannot open file"); return; }
+    setvbuf(f, NULL, _IOLBF, 0);
 
     const int base = L.gettop(Ls);
-    fprintf(g_dump, "# CJCS Lua structure dump (pure-C, rawget/next)\n");
+    fprintf(f, "# CJCS Lua probe (single rawget only, no lua_next)\n");
 
-    // ---- registry[LUA_RIDX_GLOBALS] = 真实全局表（绝对下标 base+1）----
+    // registry[LUA_RIDX_GLOBALS] = 真实全局表
     L.rawgeti(Ls, LUA_REGISTRYINDEX_C, LUA_RIDX_GLOBALS_C);
     const int gIdx = base + 1;
-    if (L.gettop(Ls) < gIdx || L.type(Ls, gIdx) != LUA_TTABLE_C) {
-        fprintf(g_dump, "ABORT: registry globals type=%d\n", L.type(Ls, gIdx));
-        L.settop(Ls, base); return;
-    }
-    // 标准库类型审计（用 rawget，不碰元方法）
-    {
-        const char *probe[] = {"string","table","math","package","require","pcall","type","pairs","tostring","select","error"};
-        for (size_t i = 0; i < sizeof(probe)/sizeof(probe[0]); i++) {
-            L.pushstring(Ls, probe[i]);
-            L.rawget(Ls, gIdx);
-            int t = L.type(Ls, -1);
-            fprintf(g_dump, "global %-8s rawget type=%d\n", probe[i], t);
-            L.settop(Ls, -1);
-        }
-    }
+    int gt = L.type(Ls, gIdx);
+    fprintf(f, "registry-globals type=%d (5=table)\n", gt);
+    if (gt != LUA_TTABLE_C) { L.settop(Ls, base); fclose(f); return; }
 
-    // ---- 取模块表：package.loaded，失败则 registry["_LOADED"] ----
+    // package.loaded → base+2 ; 失败则 registry["_LOADED"] → base+2
     int lIdx = -1;
     L.pushstring(Ls, "package");
-    L.rawget(Ls, gIdx);                                  // base+2
+    L.rawget(Ls, gIdx);
     const int pIdx = base + 2;
     if (L.type(Ls, pIdx) == LUA_TTABLE_C) {
         L.pushstring(Ls, "loaded");
-        L.rawget(Ls, pIdx);                              // base+3
-        lIdx = base + 3;
+        L.rawget(Ls, pIdx);
+        if (L.type(Ls, base + 3) == LUA_TTABLE_C) lIdx = base + 3;
     }
-    if (lIdx < 0 || L.type(Ls, lIdx) != LUA_TTABLE_C) {
-        L.settop(Ls, pIdx - 1);                          // 清掉 pkg
+    if (lIdx < 0) {
+        L.settop(Ls, gIdx);                       // 清到只剩 globals
         L.pushstring(Ls, "_LOADED");
-        L.rawget(Ls, LUA_REGISTRYINDEX_C);               // base+2
-        lIdx = base + 2;
-        fprintf(g_dump, "using registry['_LOADED'] type=%d\n", L.type(Ls, lIdx));
+        L.rawget(Ls, LUA_REGISTRYINDEX_C);
+        if (L.type(Ls, base + 2) == LUA_TTABLE_C) lIdx = base + 2;
+        fprintf(f, "registry['_LOADED'] type=%d\n", L.type(Ls, base + 2));
     }
-    if (L.type(Ls, lIdx) != LUA_TTABLE_C) {
-        mlog(@"lua dump: no module table"); L.settop(Ls, base); return;
+    if (lIdx < 0) {
+        fprintf(f, "ABORT: no module table\n");
+        L.settop(Ls, base); fclose(f); return;
+    }
+    fprintf(f, "module table at stack %d\n", lIdx);
+
+    // 只读一个已知值当"探针"，确认 loaded 表可读
+    L.pushstring(Ls, "string");
+    L.rawget(Ls, lIdx);
+    fprintf(f, "loaded['string'] type=%d (6=function)\n", L.type(Ls, -1));
+    L.settop(Ls, -1);
+
+    // ---- 按名字探测模块 ----
+    int foundMods = 0, foundFns = 0;
+    for (size_t i = 0; i < sizeof(kModProbe)/sizeof(kModProbe[0]); i++) {
+        L.pushstring(Ls, kModProbe[i]);
+        L.rawget(Ls, lIdx);                       // 单点查表
+        if (L.type(Ls, -1) != LUA_TTABLE_C) { L.settop(Ls, -1); continue; }
+        foundMods++;
+        const int mIdx = L.gettop(Ls);
+        fprintf(f, "=== MODULE %s\n", kModProbe[i]);
+        // 探测该模块内的候选函数名
+        for (size_t k = 0; k < sizeof(kFnProbe)/sizeof(kFnProbe[0]); k++) {
+            L.pushstring(Ls, kFnProbe[k]);
+            L.rawget(Ls, mIdx);
+            int tt = L.type(Ls, -1);
+            if (tt != 0) {
+                fprintf(f, "    %-22s type=%d %s\n", kFnProbe[k], tt,
+                        tt == LUA_TFUNCTION_C ? "[FUNCTION]" : "");
+                if (tt == LUA_TFUNCTION_C) foundFns++;
+            }
+            L.settop(Ls, -1);
+        }
+        L.settop(Ls, mIdx - 1);                   // 弹掉模块表
     }
 
-    // ---- 遍历模块（严格绝对下标）----
-    const int k1 = lIdx + 1;                             // 当前 key 槽
-    L.pushnil(Ls);
-    while (L.next(Ls, lIdx)) {                           // [k1][v1]
-        const int v1 = k1 + 1;
-        if (L.type(Ls, k1) == 2) {                       // ⭐ 只对【字符串键】取内容
-            size_t klen = 0;
-            const char *mod = L.tolstring(Ls, k1, &klen);
-            if (mod && L.type(Ls, v1) == LUA_TTABLE_C) {
-                g_modCount++;
-                fprintf(g_dump, "=== module %s\n", mod);
-                const int k2 = v1 + 1;
-                L.pushnil(Ls);
-                while (L.next(Ls, v1)) {                 // [k2][v2]
-                    const int v2 = k2 + 1;
-                    if (L.type(Ls, k2) == 2) {
-                        size_t flen = 0;
-                        const char *fn = L.tolstring(Ls, k2, &flen);
-                        int t2 = L.type(Ls, v2);
-                        if (fn && t2 == LUA_TFUNCTION_C) {
-                            g_fnCount++;
-                            if (mx_is_candidate(fn)) {
-                                g_candCount++;
-                                fprintf(g_dump, "  [CAND] %s\n", fn);
-                            }
-                        }
-                    }
-                    L.settop(Ls, k2);                    // 只弹 v2，保留 k2 给 next
-                }
-                // next 返回 0 时已自动 pop k2 → 栈回到 v1
-            }
-        }
-        L.settop(Ls, k1);                                // 弹 v1，保留 k1 给 next
-        if (g_modCount >= 1500) break;                   // 规模上限，防卡死
-    }
     L.settop(Ls, base);
-    fprintf(g_dump, "\n# summary: modules=%d functions=%d candidates=%d\n",
-            g_modCount, g_fnCount, g_candCount);
-    fflush(g_dump);
-    mlog(@"lua dump DONE: modules=%d functions=%d candidates=%d",
-         g_modCount, g_fnCount, g_candCount);
+    // 同时把 loaded 表里所有【直接是函数】的键也探一遍（很多库是扁平导出）
+    fprintf(f, "\n# summary: modulesFound=%d functionsFound=%d\n", foundMods, foundFns);
+    fclose(f);
+    mlog(@"lua probe DONE: modulesFound=%d functionsFound=%d", foundMods, foundFns);
     g_luaInjected = 1;
 }
 
